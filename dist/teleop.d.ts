@@ -56,6 +56,29 @@ export declare function cameraTileRect(layout: CameraLayout, role: string, vw: n
     sw: number;
     sh: number;
 } | null;
+export interface WatchdogProfile {
+    t_warn_ms: number;
+    t_stop_ms: number;
+}
+export interface RobotDescriptor {
+    buses?: string[];
+    joints?: string[];
+    base?: string[];
+    aux?: string[];
+    cameras?: string[];
+    ranges?: Record<string, [number, number]>;
+}
+export interface RobotInfo {
+    accepted: boolean;
+    protocolVersion?: number;
+    normMode?: string;
+    watchdogProfile?: WatchdogProfile;
+    descriptor?: RobotDescriptor;
+    initialState?: Record<string, number>;
+    error?: string;
+    versionMismatch: boolean;
+}
+export declare function parseAck(m: Record<string, unknown>, sdkProtocolVersion?: number): RobotInfo;
 export interface CallState {
     active: boolean;
     micMuted: boolean;
@@ -86,6 +109,7 @@ export interface RemoteTeleopOptions {
     onPerception?: (p: PerceptionView) => void;
     onActionStatus?: (s: ActionStatus) => void;
     onCameraLayout?: (layout: CameraLayout) => void;
+    onReady?: (info: RobotInfo) => void;
 }
 export declare const TASK_KEYS: Record<string, [string, number]>;
 export declare const JOINT_KEYS: Record<string, [string, number]>;
@@ -134,6 +158,7 @@ export declare class RemoteTeleop {
     private actionWaiters;
     private latestActionStatus;
     private cameraLayoutRaw;
+    private ackInfo;
     private micStream;
     private micTrack;
     private camStream;
@@ -194,9 +219,11 @@ export declare class RemoteTeleop {
     private handleTelemetry;
     private ingestPerception;
     private ingestActionStatus;
+    private ingestAck;
     private ingestCameraLayout;
     cameraLayoutInfo(): CameraLayout | null;
     cameraLayout(): string | null;
+    robotInfo(): RobotInfo | null;
     perceive(): PerceptionView | null;
     perceptionAgeMs(): number | null;
     injectPerception(frame: {

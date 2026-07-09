@@ -12,6 +12,7 @@
 //   * auth: prove possession of the room token via HMAC-SHA256(token, robot-nonce)
 //   * TURN is additive (STUN-direct preferred); forceRelay validates the relay path
 import { AudioLatencyProbe, audioLatencyEnabled } from "./audioLatency";
+import { NORI_PROTOCOL_VERSION } from "./version";
 // The states that end an action's lifecycle (awaitAction resolves on these).
 const TERMINAL_ACTION_STATES = new Set(["done", "clamped", "blocked", "timeout"]);
 // Render a CameraLayout as a one-line description for the LLM vision prompt (e.g. "top-left =
@@ -47,6 +48,29 @@ export function cameraTileRect(layout, role, vw, vh) {
     const sw = vw / layout.cols;
     const sh = vh / layout.rows;
     return { sx: (idx % layout.cols) * sw, sy: Math.floor(idx / layout.cols) * sh, sw, sh };
+}
+// Coerce a wire `ack` frame into a RobotInfo. Tolerant of old daemons that send a bare
+// {type:"ack"} (absent `accepted` counts as accepted; everything else optional). Pure +
+// exported so the handshake parse is unit-testable without a live peer.
+export function parseAck(m, sdkProtocolVersion = NORI_PROTOCOL_VERSION) {
+    const wd = m.watchdog_profile;
+    const protocolVersion = typeof m.protocol_version === "number" ? m.protocol_version : undefined;
+    return {
+        accepted: m.accepted !== false,
+        protocolVersion,
+        normMode: typeof m.norm_mode === "string" ? m.norm_mode : undefined,
+        watchdogProfile: wd && typeof wd.t_warn_ms === "number" && typeof wd.t_stop_ms === "number"
+            ? { t_warn_ms: wd.t_warn_ms, t_stop_ms: wd.t_stop_ms }
+            : undefined,
+        descriptor: m.descriptor && typeof m.descriptor === "object"
+            ? m.descriptor
+            : undefined,
+        initialState: m.initial_state && typeof m.initial_state === "object"
+            ? m.initial_state
+            : undefined,
+        error: typeof m.error === "string" ? m.error : undefined,
+        versionMismatch: protocolVersion !== undefined && protocolVersion !== sdkProtocolVersion,
+    };
 }
 // Two schemes; 'm' toggles. Default = CYLINDRICAL (the rpi4 feel).
 //  cylindrical: shoulder_pan + x/y reach (IK) + pitch + wrist_roll + gripper
@@ -165,6 +189,9 @@ export class RemoteTeleop {
         this.latestActionStatus = new Map();
         // Composite camera layout from the bridge (Phase F vision), null until it arrives / single-cam.
         this.cameraLayoutRaw = null;
+        // The parsed handshake ack (P4.1). null until the daemon's ack arrives; refreshed on every
+        // daemon (re)connect (a fresh offer means a fresh session, and the daemon re-acks).
+        this.ackInfo = null;
         // ---- two-way call (Phase 7 §B) -------------------------------------------
         this.micStream = null;
         this.micTrack = null;
@@ -511,16 +538,22 @@ export class RemoteTeleop {
     //    uplink; sendClipAudio(null) restores the mic if a call is active, else detaches.
     //  - Real-time Opus, not a file transfer: audio plays as it streams; a network drop drops
     //    the audio. The caller owns the track's lifetime (stop it when the source ends).
+    //  - Consent-gated robots (§2.1-F accept-before-unmute): the clip:true announce below means
+    //    a clip alone never rings the robot's accept prompt and never opens its room mic — the
+    //    gate applies only when the operator joinCall()s to actually hear the room.
     // Returns whether the track was actually wired to a robot uplink.
     async sendClipAudio(track) {
         this.clipTrack = track;
         if (track) {
             const wired = this.attachTrack("audio", track);
             // Announce over the control channel like a call-join so the robot links its speaker
-            // branch + shows "on air" (it intercepts {type:"call"} frames). Skip if a call is
-            // already joined — the uplink is already announced; we're just swapping the source.
+            // branch + shows "on air" (it intercepts {type:"call"} frames). clip:true marks it
+            // speaker-only: consent-gated robots (§2.1-F) must NOT ring their accept prompt —
+            // nobody is asking to hear the room — and must keep the room mic shut. Older robots
+            // ignore the extra key (they ring; harmless). Skip if a call is already joined —
+            // the uplink is already announced; we're just swapping the source.
             if (!this.call.active)
-                this.dcSend({ type: "call", state: "join", mic_muted: true });
+                this.dcSend({ type: "call", state: "join", mic_muted: true, clip: true });
             this.log(wired
                 ? "clip audio -> robot speaker"
                 : "clip audio: robot offered no audio uplink — enable --voice on the robot (not transmitting)");
@@ -969,7 +1002,7 @@ export class RemoteTeleop {
             this.ingestCameraLayout(m);
         }
         else if (m.type === "ack") {
-            this.log("daemon ack (watchdog=" + JSON.stringify(m.watchdog_profile || m.watchdog || "?") + ")");
+            this.ingestAck(m);
         }
         else if (m.type === "error") {
             this.log("daemon error: " + JSON.stringify(m));
@@ -1024,6 +1057,30 @@ export class RemoteTeleop {
                 this.latestActionStatus.delete(oldest);
         }
     }
+    // Parse + cache the daemon's handshake ack (P4.1), warn on trouble, notify onReady.
+    // Problems are ADVISORY, never fatal: mixed daemon versions exist across the fleet, and a
+    // rejected session should stay connected so telemetry/logs can show the operator why.
+    ingestAck(m) {
+        const info = parseAck(m);
+        this.ackInfo = info;
+        if (!info.accepted) {
+            this.log("DAEMON REJECTED SESSION: " + (info.error ?? "(no reason given)") +
+                " — connection stays up but control frames will be ignored");
+        }
+        else if (info.versionMismatch) {
+            this.log(`protocol version mismatch — daemon v${info.protocolVersion}, SDK targets ` +
+                `v${NORI_PROTOCOL_VERSION}. Proceeding (unknown frames are ignored by both sides); ` +
+                `expect vocabulary gaps, not unsafe behavior.`);
+        }
+        const d = info.descriptor;
+        this.log("daemon ack: accepted=" + info.accepted +
+            (info.protocolVersion !== undefined ? ` protocol=v${info.protocolVersion}` : "") +
+            (info.normMode ? ` norm=${info.normMode}` : "") +
+            (info.watchdogProfile ? ` watchdog=${info.watchdogProfile.t_warn_ms}/${info.watchdogProfile.t_stop_ms}ms` : "") +
+            (d?.joints ? ` joints=${d.joints.length}` : "") +
+            (d?.cameras?.length ? ` cameras=[${d.cameras.join(",")}]` : ""));
+        this.o.onReady?.(info);
+    }
     // Cache the composite camera layout the bridge sends on connect (Phase F vision). Ignores a
     // malformed frame (keeps any prior layout).
     ingestCameraLayout(m) {
@@ -1044,6 +1101,15 @@ export class RemoteTeleop {
     // without the operator typing it (an explicit operator description still overrides).
     cameraLayout() {
         return this.cameraLayoutRaw ? formatCameraLayout(this.cameraLayoutRaw) : null;
+    }
+    // ---- handshake (P4.1) ------------------------------------------------------
+    // The robot's self-description from the daemon's handshake ack: what it is (descriptor —
+    // joints, cameras, per-key ranges), how it speaks (protocolVersion, normMode), how it
+    // self-defends (watchdogProfile), and where it started (initialState). null until the ack
+    // arrives (shortly after the control channel opens); refreshed on daemon reconnect. Push
+    // alternative: the onReady option. Old daemons may send a bare ack — fields are optional.
+    robotInfo() {
+        return this.ackInfo;
     }
     // ---- perception (Phase F / G3) -------------------------------------------
     // Latest world-state from the daemon perception process, or null if none has arrived (detector
