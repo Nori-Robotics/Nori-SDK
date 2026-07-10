@@ -43,10 +43,28 @@ export interface ExternalJog {
 // $defs/leaderActionDeg and the daemon's normalize_leader_action_deg().
 export type LeaderActionDeg = Record<string, number>;
 
+// P4.4 — typed safety disclosure. The daemon's externally visible safety states (see the
+// README "Safety contract" for the behavioral meaning of each). `(string & {})` keeps the
+// union open: a newer daemon may add values, and unknown strings must render, not crash.
+//   safety:  "ok"        — normal
+//            "safe_hold" — motion refused, no latch: the robot is protecting itself
+//                          (thermal hold, or control-frame silence past the watchdog stop
+//                          threshold). Self-clears when the cause does.
+//            "latched"   — E-STOP latched (operator command / robot button). Motion blocked
+//                          until `command("reset_latch")`.
+// NOTE: a per-joint STALL is deliberately NOT a safety state — it's soft: torque drops on
+// the stalled joint only and it self-clears when that joint is jogged AWAY from the
+// obstruction (or on reset_latch). Scripts see it as action_status reason "stall:<joint>".
+export type SafetyState = "ok" | "safe_hold" | "latched" | (string & {});
+//   watchdog: "ok" | "warn" (control silence past t_warn_ms, or thermal load-shed) |
+//             "stop" (silence past t_stop_ms — motion blocked until frames resume).
+// Thresholds are the handshake's watchdogProfile (robotInfo()) — disclosed, not settable.
+export type WatchdogState = "ok" | "warn" | "stop" | (string & {});
+
 export interface TelemetryView {
   loopHz: number;
-  safety: string;
-  watchdog: string;
+  safety: SafetyState;
+  watchdog: WatchdogState;
   tempC: number;
   active: boolean;
   // Measured ICE path (host/host = "lan", anything via STUN/TURN = "wan"); null until the
@@ -314,6 +332,10 @@ export const JOINT_KEYS: Record<string, [string, number]> = {
 };
 export const BASE_KEYS: Record<string, [string, number]> = {
   i: ["linear", 1], k: ["linear", -1], j: ["angular", 1], l: ["angular", -1],
+  // WASD alias for the same base DOFs. jogTick gives the ARM keymap first claim on a
+  // key, so these only take effect while a leader source owns the arms (arm keys are
+  // ignored then) — plain keyboard driving keeps WASD on the arm exactly as before.
+  w: ["linear", 1], s: ["linear", -1], a: ["angular", 1], d: ["angular", -1],
 };
 export const ZLIFT_KEYS: Record<string, number> = { u: 1, o: -1 };
 export const CMD_KEYS: Record<string, string> = { " ": "estop", p: "reset_latch", c: "reset" };
@@ -327,10 +349,31 @@ function rowsFromAxisMap(map: Record<string, [string, number]>): KeybindRow[] {
   const byDof = new Map<string, KeybindRow>();
   for (const [key, [dof, sign]] of Object.entries(map)) {
     const row = byDof.get(dof) ?? { dof, posKey: "", negKey: "" };
-    if (sign > 0) row.posKey = key; else row.negKey = key;
+    // First key wins per (dof, sign) so alias keys (WASD on the base) don't displace
+    // the primary binding in the legend.
+    if (sign > 0) row.posKey ||= key; else row.negKey ||= key;
     byDof.set(dof, row);
   }
   return [...byDof.values()];
+}
+
+// One inverted-T drive cluster (forward above turn-left/reverse/turn-right), WASD-style.
+export interface BaseKeyCluster { forward: string; left: string; back: string; right: string; }
+
+// Split BASE_KEYS (in declaration order) into complete inverted-T clusters for keypad-style
+// legends — primary IJKL first, then the WASD alias. Derived from the live map so the
+// legend can never drift from what the keys actually send (C3).
+export function baseKeyClusters(): BaseKeyCluster[] {
+  const clusters: BaseKeyCluster[] = [];
+  let cur: Partial<BaseKeyCluster> = {};
+  for (const [key, [dof, sign]] of Object.entries(BASE_KEYS)) {
+    const slot: keyof BaseKeyCluster =
+      dof === "linear" ? (sign > 0 ? "forward" : "back") : sign > 0 ? "left" : "right";
+    if (cur[slot] !== undefined) { clusters.push(cur as BaseKeyCluster); cur = {}; }
+    cur[slot] = key;
+  }
+  if (Object.keys(cur).length) clusters.push(cur as BaseKeyCluster);
+  return clusters;
 }
 
 // Structured control legend for a given mode — derived from the exported maps above so it
@@ -1398,7 +1441,9 @@ export class RemoteTeleop {
       // While a leader source drives the arms, arm keys are ignored (leader wins on those
       // joints); base + lift keys still apply so the operator drives the base/rails by hand.
       if (!leader && k in km) { const [d, s] = km[k]; a[d] = s; }
-      else if (k in BASE_KEYS) { const [dof, s] = BASE_KEYS[k]; base[dof] = s; }
+      // Firmware turns the base opposite our "+angular = left" convention, so negate the
+      // angular sign on the wire (keeps BASE_KEYS/legend reading a,j = left, and now true).
+      else if (k in BASE_KEYS) { const [dof, s] = BASE_KEYS[k]; base[dof] = dof === "angular" ? -s : s; }
       else if (k in ZLIFT_KEYS) z = ZLIFT_KEYS[k];
     }
     // Leader mode: arms come from leader_action_deg, so the jog carries only base + lift.

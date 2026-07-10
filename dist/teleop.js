@@ -93,6 +93,10 @@ export const JOINT_KEYS = {
 };
 export const BASE_KEYS = {
     i: ["linear", 1], k: ["linear", -1], j: ["angular", 1], l: ["angular", -1],
+    // WASD alias for the same base DOFs. jogTick gives the ARM keymap first claim on a
+    // key, so these only take effect while a leader source owns the arms (arm keys are
+    // ignored then) — plain keyboard driving keeps WASD on the arm exactly as before.
+    w: ["linear", 1], s: ["linear", -1], a: ["angular", 1], d: ["angular", -1],
 };
 export const ZLIFT_KEYS = { u: 1, o: -1 };
 export const CMD_KEYS = { " ": "estop", p: "reset_latch", c: "reset" };
@@ -102,13 +106,33 @@ function rowsFromAxisMap(map) {
     const byDof = new Map();
     for (const [key, [dof, sign]] of Object.entries(map)) {
         const row = byDof.get(dof) ?? { dof, posKey: "", negKey: "" };
+        // First key wins per (dof, sign) so alias keys (WASD on the base) don't displace
+        // the primary binding in the legend.
         if (sign > 0)
-            row.posKey = key;
+            row.posKey || (row.posKey = key);
         else
-            row.negKey = key;
+            row.negKey || (row.negKey = key);
         byDof.set(dof, row);
     }
     return [...byDof.values()];
+}
+// Split BASE_KEYS (in declaration order) into complete inverted-T clusters for keypad-style
+// legends — primary IJKL first, then the WASD alias. Derived from the live map so the
+// legend can never drift from what the keys actually send (C3).
+export function baseKeyClusters() {
+    const clusters = [];
+    let cur = {};
+    for (const [key, [dof, sign]] of Object.entries(BASE_KEYS)) {
+        const slot = dof === "linear" ? (sign > 0 ? "forward" : "back") : sign > 0 ? "left" : "right";
+        if (cur[slot] !== undefined) {
+            clusters.push(cur);
+            cur = {};
+        }
+        cur[slot] = key;
+    }
+    if (Object.keys(cur).length)
+        clusters.push(cur);
+    return clusters;
 }
 // Structured control legend for a given mode — derived from the exported maps above so it
 // can never drift from what the keys actually send.
@@ -1218,9 +1242,11 @@ export class RemoteTeleop {
                 const [d, s] = km[k];
                 a[d] = s;
             }
+            // Firmware turns the base opposite our "+angular = left" convention, so negate the
+            // angular sign on the wire (keeps BASE_KEYS/legend reading a,j = left, and now true).
             else if (k in BASE_KEYS) {
                 const [dof, s] = BASE_KEYS[k];
-                base[dof] = s;
+                base[dof] = dof === "angular" ? -s : s;
             }
             else if (k in ZLIFT_KEYS)
                 z = ZLIFT_KEYS[k];

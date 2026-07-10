@@ -9,10 +9,12 @@ export interface ExternalJog {
     right_lift?: number;
 }
 export type LeaderActionDeg = Record<string, number>;
+export type SafetyState = "ok" | "safe_hold" | "latched" | (string & {});
+export type WatchdogState = "ok" | "warn" | "stop" | (string & {});
 export interface TelemetryView {
     loopHz: number;
-    safety: string;
-    watchdog: string;
+    safety: SafetyState;
+    watchdog: WatchdogState;
     tempC: number;
     active: boolean;
     linkMode: "lan" | "wan" | null;
@@ -121,6 +123,13 @@ export interface KeybindRow {
     posKey: string;
     negKey: string;
 }
+export interface BaseKeyCluster {
+    forward: string;
+    left: string;
+    back: string;
+    right: string;
+}
+export declare function baseKeyClusters(): BaseKeyCluster[];
 export declare function keybindLegend(mode: ControlMode): {
     arm: KeybindRow[];
     base: KeybindRow[];
