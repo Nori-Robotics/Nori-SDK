@@ -1,4 +1,5 @@
 import type { SignalingTransport } from "./signaling";
+import { type VideoNetState } from "./videoQuality";
 export type ControlMode = "cylindrical" | "joint";
 export type ArmSide = "left" | "right";
 export interface ExternalJog {
@@ -20,6 +21,8 @@ export interface TelemetryView {
     linkMode: "lan" | "wan" | null;
     currents: Record<string, number>;
     state: Record<string, number>;
+    videoNet: VideoNetState | null;
+    batteryPercent: number | null;
 }
 export interface PerceivedObject {
     label: string;
@@ -40,6 +43,18 @@ export interface ActionStatus {
     state: ActionState;
     reason?: string;
     ts_ns?: number;
+}
+export interface DaemonStatus {
+    state: "online" | "offline" | (string & {});
+    reason?: string;
+    detail?: string;
+}
+export type ConnectPhase = "idle" | "joining" | "waiting" | "negotiating" | "connected" | "failed";
+export type ConnectFailure = "signaling_unreachable" | "bad_access_code" | "robot_not_responding" | "ice_failed" | "negotiation_failed" | "session_rejected";
+export interface ConnectStatus {
+    phase: ConnectPhase;
+    reason?: ConnectFailure;
+    detail?: string;
 }
 export interface CameraLayout {
     cols: number;
@@ -87,7 +102,17 @@ export interface CallState {
     micSending: boolean;
     robotAudio: boolean;
     robotMicLive: boolean;
+    robotMicMuted: boolean;
     cameraOn: boolean;
+}
+export interface RecordState {
+    ok: boolean;
+    recording: boolean;
+    sessionOpen?: boolean;
+    episodesKept?: number;
+    episode?: string;
+    freeGb?: number;
+    error?: string;
 }
 export interface RemoteTeleopOptions {
     signaling: SignalingTransport;
@@ -103,6 +128,7 @@ export interface RemoteTeleopOptions {
     mode?: ControlMode;
     onLog: (msg: string) => void;
     onConnState: (state: string) => void;
+    onConnectStatus?: (s: ConnectStatus) => void;
     onTelemetry: (t: TelemetryView) => void;
     onMode: (mode: ControlMode) => void;
     onControlActive: (active: boolean) => void;
@@ -111,7 +137,10 @@ export interface RemoteTeleopOptions {
     onPerception?: (p: PerceptionView) => void;
     onActionStatus?: (s: ActionStatus) => void;
     onCameraLayout?: (layout: CameraLayout) => void;
+    onControlSent?: (frame: Record<string, unknown>, tWallMs: number) => void;
+    onDaemonStatus?: (s: DaemonStatus) => void;
     onReady?: (info: RobotInfo) => void;
+    onRecord?: (s: RecordState) => void;
 }
 export declare const TASK_KEYS: Record<string, [string, number]>;
 export declare const JOINT_KEYS: Record<string, [string, number]>;
@@ -139,6 +168,7 @@ export declare function keybindLegend(mode: ControlMode): {
         label: string;
     }[];
 };
+export declare function hmacHex(key: string, msg: string): Promise<string>;
 export declare class RemoteTeleop {
     private o;
     private pc;
@@ -147,13 +177,19 @@ export declare class RemoteTeleop {
     private connected;
     private retryTimer;
     private latencyProbe;
+    private videoLoop;
     private jogTimer;
     private controlCh;
     private curMac;
+    private nackFailTimer;
     private linkMode;
+    private connStatus;
+    private waitTimer;
     private mode;
     private externalJog;
     private externalLeader;
+    private keyboardSpeed;
+    private policyDriving;
     private inboundVideo;
     private inboundAudio;
     private videoPaused;
@@ -167,6 +203,8 @@ export declare class RemoteTeleop {
     private actionWaiters;
     private latestActionStatus;
     private cameraLayoutRaw;
+    private daemonStat;
+    private recStat;
     private ackInfo;
     private micStream;
     private micTrack;
@@ -185,17 +223,24 @@ export declare class RemoteTeleop {
     }): CameraViewHandle | null;
     getArm(): ArmSide;
     setExternalJog(jog: ExternalJog | null): void;
+    setKeyboardSpeed(s: number): void;
     setLeaderAction(leader: LeaderActionDeg | null): void;
     sendAction(action: Record<string, number>, actionId?: string): void;
     nextActionId(): string;
+    setPolicyDriving(on: boolean): void;
     actionStatus(id: string): ActionStatus | null;
     awaitAction(id: string, opts?: {
         timeoutMs?: number;
     }): Promise<ActionStatus>;
     command(cmd: "estop" | "reset_latch" | "reset"): void;
-    setVideoQuality(quality: "low" | "normal"): void;
+    setVideoQuality(quality: "low" | "normal" | number): void;
+    record(action: "session_start" | "episode_start" | "episode_stop" | "episode_discard" | "session_end" | "session_discard" | "start" | "stop" | "discard" | "discard_last" | "status", task?: string): void;
     pauseVideo(): void;
     resumeVideo(): void;
+    /** Current encoder gate state, so a transient consumer (e.g. a policy rollout that
+     *  force-resumes to grab frames) can RESTORE what it found instead of blindly
+     *  pausing on exit — blindly pausing freezes the preview of a page still on screen. */
+    isVideoPaused(): boolean;
     private setVideoPaused;
     captureFrame(mime?: string, quality?: number, role?: string): Promise<Blob | null>;
     snapshot(settleMs?: number, role?: string): Promise<Blob | null>;
@@ -217,6 +262,11 @@ export declare class RemoteTeleop {
     private offerWantsAudioUplink;
     private stopStream;
     private iceServers;
+    private setPhase;
+    connectStatus(): ConnectStatus;
+    private armWaitDeadline;
+    private clearWaitDeadline;
+    private clearNackTimer;
     start(): Promise<void>;
     stop(): Promise<void>;
     logAudioLatency(): Promise<import("./audioLatency").AudioLatencySample | null>;
@@ -231,6 +281,10 @@ export declare class RemoteTeleop {
     private ingestAck;
     private ingestCameraLayout;
     cameraLayoutInfo(): CameraLayout | null;
+    private ingestDaemonStatus;
+    daemonStatus(): DaemonStatus | null;
+    private ingestRecordStatus;
+    recordState(): RecordState | null;
     cameraLayout(): string | null;
     robotInfo(): RobotInfo | null;
     perceive(): PerceptionView | null;

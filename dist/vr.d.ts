@@ -25,12 +25,25 @@ export interface VrMapResult {
     jog: ExternalJog | null;
     estop: boolean;
 }
+export interface VrTuning {
+    sensitivity?: number;
+    gripperOpenRate?: number;
+}
+export declare function resolveTuning(t?: VrTuning): Required<VrTuning>;
 export declare class VrJogMapper {
     private readonly left;
     private readonly right;
     private estopPrev;
+    private tuning;
+    private gripperPos;
     private controlYaw;
     setControlYaw(yawRad: number): void;
+    setTuning(t: VrTuning): void;
+    setGripperPos(left: number | null, right: number | null): void;
+    engagedArms(): {
+        left: boolean;
+        right: boolean;
+    };
     reclutch(): void;
     map(frame: VrFrame): VrMapResult;
 }

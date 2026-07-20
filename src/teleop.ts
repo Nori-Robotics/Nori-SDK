@@ -14,6 +14,7 @@
 
 import type { SignalingTransport } from "./signaling";
 import { AudioLatencyProbe, audioLatencyEnabled } from "./audioLatency";
+import { VideoQualityLoop, type VideoNetState } from "./videoQuality";
 import { NORI_PROTOCOL_VERSION } from "./version";
 
 export type ControlMode = "cylindrical" | "joint";
@@ -87,6 +88,16 @@ export interface TelemetryView {
   // Pi-side stall homing lands, so values can be negative). The keys are OMITTED while the
   // Pi's tracker isn't valid — treat absence as "height unknown", not zero.
   state: Record<string, number>;
+  // Adaptive-video link state (videoQuality.ts, ~1 Hz): delivered fps / loss / RTT and the ABR
+  // controller's current bitrate target. Null until the first sample after connect (and cleared
+  // on disconnect) — this is how a UI shows "poor network, quality reduced" instead of letting
+  // a black/frozen feed hide behind a green "connected" chip.
+  videoNet: VideoNetState | null;
+  // Pack state-of-charge % (0-100), injected by the robot bridge into each telemetry frame
+  // (docs/battery_monitor_integration.md §5). null when the robot has no battery monitor, the
+  // reader is down, or the pack voltage is out of range — render "—", never 0%. Absent on old
+  // bridges -> stays null (graceful degradation, like robot_mic_live).
+  batteryPercent: number | null;
 }
 
 // A single object the on-Pi detector reports (nori-protocol perception.json $items). Fields
@@ -102,7 +113,7 @@ export interface PerceivedObject {
 
 // A structured world-state snapshot from the daemon's perception process (Phase F / G3).
 // DISTINCT from telemetry (proprioception — the robot's own joints) and the video track (human
-// eyes): this is what a *running script* reacts to via robot.perceive(). Low-rate (~2-10 Hz),
+// eyes): this is what a *running script* reacts to via nori.perceive(). Low-rate (~2-10 Hz),
 // decoupled from the 50 Hz control loop. `objects: []` is a real "nothing seen", not "no data".
 export interface PerceptionView {
   ts_ns: number;             // Pi capture time (same clock as telemetry.ts_ns)
@@ -123,6 +134,72 @@ export interface ActionStatus {
 }
 // The states that end an action's lifecycle (awaitAction resolves on these).
 const TERMINAL_ACTION_STATES = new Set<ActionState>(["done", "clamped", "blocked", "timeout"]);
+
+
+// Robot-daemon health as observed by the Pi's media bridge (nori_protocol_schema §5b). The bridge —
+// not the daemon — knows when the daemon is down/restarting/refusing sessions, so it publishes this
+// on the control channel: on every transition, re-broadcast every 3 s while offline. Idempotent
+// state, not an event — render the latest one. Distinct from the WebRTC connState: the peer (media
+// bridge) can be fully connected while the daemon behind it is dead, which used to read as
+// "connected" with silently dead control ("random downtime").
+export interface DaemonStatus {
+  state: "online" | "offline" | (string & {});
+  // offline only — why. Known values the UI maps to remedies:
+  //   startup_positions  an arm reports no positions (usually lost power) → power-cycle the arm
+  //   bus_lost           USB servo bus disconnected → daemon is restarting itself
+  //   unauthorized       agent token mismatch (provisioning problem)
+  //   unreachable | connection_lost   daemon down or restarting (no more-specific reason)
+  reason?: string;
+  detail?: string; // operator-facing text; carries the daemon's own message when it sent one
+}
+
+// ---- connect diagnostics ---------------------------------------------------------------
+// Why this exists: `connState` is the raw RTCPeerConnection state, and a peer connection isn't
+// even created until the robot's offer arrives. So during the ENTIRE "is my robot going to
+// answer?" window — the window where nearly every real-world failure happens — connState reads
+// "idle" and the UI showed `conn: idle` forever with no error text. This is a phase the operator
+// can actually reason about, plus a machine reason the UI maps to a plain-English remedy (the
+// same shape as DaemonStatus above).
+export type ConnectPhase =
+  | "idle"          // not connecting
+  | "joining"       // opening the signaling room
+  | "waiting"       // in the room, announced 'ready', waiting for the robot to offer
+  | "negotiating"   // offer received; building the peer + exchanging ICE
+  | "connected"     // peer connected
+  | "failed";       // gave up / hard failure — `reason` says why
+
+export type ConnectFailure =
+  // Can't reach the signaling service at all: the operator's own internet, or Nori's service.
+  | "signaling_unreachable"
+  // The robot explicitly rejected our access code (it sent a `nack`). This is the ONLY way to
+  // know the code is wrong: a robot that doesn't recognise the code otherwise stays silent, which
+  // is indistinguishable from being switched off.
+  | "bad_access_code"
+  // Nobody answered in the room at all. That means the robot is off, has no internet, or we're
+  // pointed at the wrong robot. It ALSO still covers a wrong access code on a robot too old to
+  // send a nack — so the remedy text names that possibility rather than asserting the robot is off.
+  | "robot_not_responding"
+  // The robot answered but no network path could be established (NAT/firewall/TURN).
+  | "ice_failed"
+  // The offer/answer exchange itself threw (malformed SDP, browser refused the answer).
+  | "negotiation_failed"
+  // We reached the robot and it refused the session (handshake ack accepted:false).
+  | "session_rejected";
+
+export interface ConnectStatus {
+  phase: ConnectPhase;
+  reason?: ConnectFailure;
+  detail?: string; // free text for the log / secondary line; never the primary user message
+}
+
+// How long to sit in "waiting" before calling it a failure. The client keeps re-announcing
+// 'ready' underneath (a robot that boots late still connects on its own) — this deadline only
+// decides when we STOP staying silent and tell the operator something is wrong.
+const WAIT_FOR_ROBOT_MS = 12_000;
+// A nack to our first, mac-less 'ready' is an expected pre-handshake artifact (see onNack),
+// so once we HAVE presented a mac we still wait this long before calling it a bad code — a
+// nack racing an in-flight authorized handshake is cancelled the instant the offer arrives.
+const NACK_CONFIRM_MS = 2_500;
 
 // Which camera is in which composite tile (bridge-derived, from cameras.json order). Sent by the Pi
 // media bridge on control-channel open in composite mode; lets the LLM-vision path know which feed is
@@ -258,7 +335,27 @@ export interface CallState {
   micSending: boolean;   // mic is actually wired to a robot uplink transceiver (else: local-only)
   robotAudio: boolean;   // an inbound audio track from the robot is attached to the sink
   robotMicLive: boolean; // robot reports its mic is live (telemetry; reserved field)
+  // Robot-side local mute (W2.5 consent UX): robots BOOT muted; someone at the robot
+  // unmutes via the kiosk/button. Distinct from !robotMicLive (which is also false when
+  // audio simply isn't wired) — true means "muted at the robot, ask a local person".
+  // Absent on old bridges -> stays false and the UI behaves as before.
+  robotMicMuted: boolean;
   cameraOn: boolean;     // M6 (gated): operator camera is sending
+}
+
+// W2.11 on-robot episode recording: the reply to a record() command, relayed by the
+// bridge from the robot's always-on recorder ({type:"record_status"} frames). Null
+// until the first reply — record({action:"status"}) on connect is the cheap probe.
+// `error` covers both refusals (disk low) and "recorder unreachable" (robot has
+// recording disabled or the recorder service is down — a definite no, not silence).
+export interface RecordState {
+  ok: boolean;
+  recording: boolean;    // an episode is actively capturing right now
+  sessionOpen?: boolean; // a session is open (may be between episodes, not capturing)
+  episodesKept?: number; // episodes kept in the open session so far
+  episode?: string;      // "<session>/<episode-NNNN>" while recording
+  freeGb?: number;       // spool disk headroom on the robot
+  error?: string;
 }
 
 export interface RemoteTeleopOptions {
@@ -287,6 +384,10 @@ export interface RemoteTeleopOptions {
   mode?: ControlMode;
   onLog: (msg: string) => void;
   onConnState: (state: string) => void;
+  // Optional: the connect-phase machine (see ConnectStatus). This is what a UI should render as
+  // "what is happening / what went wrong"; onConnState remains the raw WebRTC state for anyone
+  // who wants it. Fires on every transition, deduped.
+  onConnectStatus?: (s: ConnectStatus) => void;
   onTelemetry: (t: TelemetryView) => void;
   onMode: (mode: ControlMode) => void;
   onControlActive: (active: boolean) => void;
@@ -304,11 +405,25 @@ export interface RemoteTeleopOptions {
   // Optional: the composite camera layout (bridge-derived), when it arrives. A consumer usually
   // reads cameraLayout() at use-time instead of subscribing.
   onCameraLayout?: (layout: CameraLayout) => void;
+  // Optional: observer for every OUTBOUND control frame ({type:"control", jog|action|
+  // leader_action_deg|reset...}) at the moment it is written to the data channel, with the
+  // send wall-clock (Date.now()). The dataset catcher records these as ground-truth action
+  // provenance — the operator side is the only place the commands exist (the daemon never
+  // echoes them). Observer only: throwing here is swallowed; it can never affect control.
+  onControlSent?: (frame: Record<string, unknown>, tWallMs: number) => void;
+  // Optional: robot-daemon health transitions (bridge-derived daemon_status frames). Fires on
+  // every state/reason change (the bridge's 3 s while-offline repeats are deduped). This is how
+  // a UI distinguishes "robot online but daemon down/restarting" from a healthy session — the
+  // WebRTC connState alone cannot. Poll daemonStatus() for the latest value at use-time.
+  onDaemonStatus?: (s: DaemonStatus) => void;
   // Optional: the daemon's handshake ack (robot self-description — joints, cameras, ranges,
   // watchdog profile, initial pose). Fires once per daemon (re)connect; poll robotInfo()
   // instead if you only need it at use-time. Check info.accepted / info.versionMismatch here
   // if you want to surface handshake problems in your own UI (the SDK already logs them).
   onReady?: (info: RobotInfo) => void;
+  // Optional: on-robot episode recording state (W2.11) — fires on every record_status
+  // reply to a record() command. Poll recordState() for the latest value at use-time.
+  onRecord?: (s: RecordState) => void;
 }
 
 // Two schemes; 'm' toggles. Default = CYLINDRICAL (the rpi4 feel).
@@ -401,7 +516,11 @@ export function keybindLegend(mode: ControlMode): {
 const JOG_HZ_MS = 20; // 50 Hz level-jog
 const BUFFER_LIMIT = 16384; // skip a jog frame if the channel is congested
 
-async function hmacHex(key: string, msg: string): Promise<string> {
+// The room-auth proof: HMAC-SHA256 of the robot's nonce under the room token, lowercase hex.
+// Exported so the mock robot (@nori/sdk/mock) verifies with the SAME primitive the operator
+// signs with — two copies of this would have to stay byte-identical (key encoding, hash, hex
+// padding) forever, and any drift would surface as an unexplained "wrong access code".
+export async function hmacHex(key: string, msg: string): Promise<string> {
   if (!crypto.subtle) {
     throw new Error("crypto.subtle unavailable — open the app over http://localhost or https");
   }
@@ -421,10 +540,15 @@ export class RemoteTeleop {
   private connected = false;
   private retryTimer: ReturnType<typeof setInterval> | null = null;
   private latencyProbe: AudioLatencyProbe | null = null; // R-X.2 audio-latency harness (per peer)
+  private videoLoop: VideoQualityLoop | null = null;     // ABR loop (videoQuality.ts, per peer)
   private jogTimer: ReturnType<typeof setInterval> | null = null;
   private controlCh: RTCDataChannel | null = null;
   private curMac = ""; // HMAC of the robot's nonce, proving we hold the token
+  private nackFailTimer: ReturnType<typeof setTimeout> | null = null; // debounces a nack -> bad_access_code
   private linkMode: "lan" | "wan" | null = null; // measured ICE path -> daemon watchdog
+  // Connect-phase machine (see ConnectStatus). `waitTimer` is the "robot never answered" deadline.
+  private connStatus: ConnectStatus = { phase: "idle" };
+  private waitTimer: ReturnType<typeof setTimeout> | null = null;
   private mode: ControlMode = "cylindrical";
   // When non-null, the jog tick sends this payload instead of the keyboard-derived one
   // (set by the VR session each frame; null = keyboard owns the stream). An all-zeros
@@ -434,6 +558,16 @@ export class RemoteTeleop {
   // frame (arms follow the physical leader arms); base + lift still come from the keyboard.
   // Set by the leader driver each poll; null = no leader source (arms owned by keyboard/VR).
   private externalLeader: LeaderActionDeg | null = null;
+  // Keyboard jog speed in (0..1] — scales every held-key rate (arm, base, lift) before it
+  // goes on the wire. 1 (default) = the daemon's full per-tick step, i.e. legacy behavior.
+  // Keyboard-only: VR carries its own tuning (VrJogMapper.setTuning) and passes through
+  // externalJog untouched; leader targets are absolute and unaffected.
+  private keyboardSpeed = 1;
+  // When true, an autonomous policy owns the control stream via sendAction(): the 50 Hz
+  // jog tick yields entirely so its ever-present "hold" frame (idle zero-jog, or a
+  // leader's absolute targets) can't out-vote the policy's ~10 Hz absolute actions and
+  // pin the arm. Set by PolicyRunner around a rollout. See jogTick + setPolicyDriving.
+  private policyDriving = false;
   // Last inbound robot media streams, remembered so setVideoEl/setAudioEl can re-point a fresh
   // DOM element at the live stream after a page swap (the session can outlive the page that
   // rendered the original <video>/<audio>). See setVideoEl below.
@@ -448,7 +582,8 @@ export class RemoteTeleop {
   // loop_hz / temp / status only ride the periodic telemetry block, not every per-tick
   // frame — keep last values so the readout doesn't flicker to 0.
   private tel: TelemetryView = {
-    loopHz: 0, safety: "-", watchdog: "-", tempC: 0, active: false, linkMode: null, currents: {}, state: {},
+    loopHz: 0, safety: "-", watchdog: "-", tempC: 0, active: false, linkMode: null, currents: {},
+    state: {}, videoNet: null, batteryPercent: null,
   };
   private stopped = false;
   // Latest world-state from the daemon perception process (Phase F). null until a frame arrives
@@ -467,6 +602,8 @@ export class RemoteTeleop {
 
   // Composite camera layout from the bridge (Phase F vision), null until it arrives / single-cam.
   private cameraLayoutRaw: CameraLayout | null = null;
+  private daemonStat: DaemonStatus | null = null;   // latest daemon_status (bridge health frame)
+  private recStat: RecordState | null = null;       // latest record_status (W2.11 recorder reply)
   // The parsed handshake ack (P4.1). null until the daemon's ack arrives; refreshed on every
   // daemon (re)connect (a fresh offer means a fresh session, and the daemon re-acks).
   private ackInfo: RobotInfo | null = null;
@@ -483,7 +620,7 @@ export class RemoteTeleop {
   private clipTrack: MediaStreamTrack | null = null;
   private call: CallState = {
     active: false, micMuted: true, micSending: false,
-    robotAudio: false, robotMicLive: false, cameraOn: false,
+    robotAudio: false, robotMicLive: false, robotMicMuted: false, cameraOn: false,
   };
 
   constructor(opts: RemoteTeleopOptions) {
@@ -545,6 +682,14 @@ export class RemoteTeleop {
     video.muted = true;
     video.playsInline = true;
     video.srcObject = src;
+    // The draw loop below is driven by requestVideoFrameCallback, which only fires
+    // when a frame is PRESENTED to the compositor. A detached <video> (never in the
+    // DOM) is never presented, so rvfc never fires, drawImage never runs, and the
+    // captured crop stream stays empty (0x0) — the "policy drives but nothing moves"
+    // failure. Keep the element in the render tree but visually gone so it decodes.
+    video.style.cssText =
+      "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;";
+    document.body.appendChild(video);
     void video.play().catch(() => { /* autoplay quirks: captureStream still pulls frames */ });
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d");
@@ -582,6 +727,7 @@ export class RemoteTeleop {
       stop() {
         stopped = true;
         video.srcObject = null;
+        video.remove();
         for (const t of stream.getTracks()) t.stop();
       },
     };
@@ -598,6 +744,12 @@ export class RemoteTeleop {
   // to release the stream back to the keyboard. The next jogTick uses it as-is.
   setExternalJog(jog: ExternalJog | null) {
     this.externalJog = jog;
+  }
+
+  // Keyboard jog speed (user setting). Takes effect on the next 50 Hz tick; clamped to
+  // (0..1] so it can only slow keys down, never exceed the daemon's full rate.
+  setKeyboardSpeed(s: number) {
+    this.keyboardSpeed = Math.max(0.05, Math.min(1, s));
   }
 
   // Physical leader arms hand the jog tick their measured absolute targets (degrees /
@@ -628,6 +780,15 @@ export class RemoteTeleop {
     return `a${++this.actionSeq}`;
   }
 
+  // Hand the arms to an autonomous policy (or take them back). While on, the 50 Hz
+  // jog tick drops the leader's absolute targets and held keys so only sendAction()
+  // drives the arms — otherwise the ever-present jog frame out-votes the policy and
+  // the arm never reaches the commanded pose. Call setPolicyDriving(false) to restore
+  // normal keyboard/leader control. See jogTick.
+  setPolicyDriving(on: boolean) {
+    this.policyDriving = on;
+  }
+
   // Latest action_status seen for `id` (any state), or null. The executor uses this to detect
   // whether the daemon is Phase-E-capable (any status seen) vs. silent (old daemon → fall back to
   // client-side arrival detection).
@@ -654,12 +815,53 @@ export class RemoteTeleop {
   }
 
   // Ask the robot to drop / restore its camera-encoder bitrate to free CPU+bandwidth while
-  // the laptop adds load (e.g. streaming a clip to the speaker). "low" halves the x264 bitrate
-  // on the robot; "normal" restores the default. Intercepted by webrtc_robot.py (never reaches
-  // the daemon), exactly like {type:"call"} — no nori-protocol change, no version bump.
-  setVideoQuality(quality: "low" | "normal") {
-    this.dcSend({ type: "video", quality });
+  // the laptop adds load (e.g. streaming a clip to the speaker). "low" cuts the x264 bitrate
+  // on the robot; "normal" restores the default; a NUMBER requests that exact kbps (clamped
+  // robot-side to its --bitrate ceiling — this is what the ABR loop streams). Intercepted by
+  // webrtc_robot.py (never reaches the daemon), exactly like {type:"call"} — no nori-protocol
+  // change, no version bump. NOTE: while connected, the ABR loop re-asserts its own target
+  // every second, so a manual value only sticks if the loop is stopped first.
+  setVideoQuality(quality: "low" | "normal" | number) {
+    this.dcSend(typeof quality === "number"
+      ? { type: "video", bitrate: quality }
+      : { type: "video", quality });
   }
+
+  // W2.11 on-robot episode recording: drive the robot's always-on recorder (the Pi
+  // spools full-quality frames + telemetry + actions for policy training — NOT the
+  // degraded live stream you're watching). Bridge-intercepted like {type:"video"}/
+  // {type:"call"} — never reaches the daemon, no nori-protocol change. The reply
+  // arrives as onRecord / recordState(); a robot with recording disabled answers
+  // {ok:false, error:"recorder unreachable"} within ~1 s rather than staying silent.
+  //
+  // Two-tier protocol (W2.11 one-bundle-per-session — a session ships as ONE
+  // raw_bundle holding N episodes):
+  //   session_start {task} -> episode_start -> episode_stop [-> episode_discard]
+  //     (repeat episodes) -> session_end (keep+ship) | session_discard (drop all)
+  //   - episode_discard: Reject the just-recorded episode (deletes its robot copy;
+  //     other kept episodes stay). Safe because Reject is while still connected, so
+  //     the idle-gated shipper hasn't uploaded the session yet.
+  //   - session_end: close the session; it uploads when the robot next idles.
+  // Legacy one-episode aliases (kept for the bench page / auto mode): start {task}
+  // = session_start+episode_start; stop = episode_stop+session_end; discard /
+  // discard_last = session_discard.
+  record(
+    action:
+      | "session_start" | "episode_start" | "episode_stop" | "episode_discard"
+      | "session_end" | "session_discard"
+      | "start" | "stop" | "discard" | "discard_last" | "status",
+    task?: string,
+  ) {
+    const msg: Record<string, unknown> = { type: "record", action };
+    // Task rides episode_start too: if session_start dropped on the unreliable
+    // control channel, the robot auto-opens a session on episode_start and needs
+    // the task from here so it isn't lost.
+    if ((action === "start" || action === "session_start" || action === "episode_start") && task) {
+      msg.task = task;
+    }
+    this.dcSend(msg);
+  }
+
 
   // Pause/resume the robot's video ENCODER (not just the DOM sink). "pause" gates frames before
   // the software x264 encoder so it goes idle — the real Pi CPU/power saving; "resume" re-opens it
@@ -667,6 +869,10 @@ export class RemoteTeleop {
   // Safe to call before the control channel is open — the desired state is flushed on open.
   pauseVideo() { this.setVideoPaused(true); }
   resumeVideo() { this.setVideoPaused(false); }
+  /** Current encoder gate state, so a transient consumer (e.g. a policy rollout that
+   *  force-resumes to grab frames) can RESTORE what it found instead of blindly
+   *  pausing on exit — blindly pausing freezes the preview of a page still on screen. */
+  isVideoPaused(): boolean { return this.videoPaused; }
   private setVideoPaused(paused: boolean) {
     this.videoPaused = paused;
     this.dcSend({ type: "video", state: paused ? "pause" : "resume" });
@@ -933,16 +1139,58 @@ export class RemoteTeleop {
   }
 
   private iceServers(): RTCIceServer[] {
-    const servers: RTCIceServer[] = [{ urls: this.o.stun }];
+    // An empty `stun` means "no STUN server", not "a server whose URL is the empty string":
+    // RTCPeerConnection REJECTS `{urls: ""}` with a SyntaxError at construction, which would
+    // take down the whole session. Omitting it is the valid configuration for the two cases
+    // that legitimately need no STUN — same-LAN sessions (host candidates suffice) and the
+    // in-page mock robot (@nori/sdk/mock), whose dev loop must not touch the network at all.
+    const servers: RTCIceServer[] = this.o.stun ? [{ urls: this.o.stun }] : [];
     if (this.o.turnUrls.length) {
       servers.push({ urls: this.o.turnUrls, username: this.o.turnUser, credential: this.o.turnCred });
     }
     return servers;
   }
 
+  // ---- connect phase machine -----------------------------------------------
+  // Single writer for ConnectStatus. Deduped so a repeated transition (e.g. Supabase flapping
+  // CHANNEL_ERROR) doesn't spam the UI or the log.
+  private setPhase(phase: ConnectPhase, reason?: ConnectFailure, detail?: string) {
+    const prev = this.connStatus;
+    if (prev.phase === phase && prev.reason === reason && prev.detail === detail) return;
+    this.connStatus = { phase, ...(reason ? { reason } : {}), ...(detail ? { detail } : {}) };
+    this.o.onConnectStatus?.(this.connStatus);
+  }
+
+  // Latest connect phase, for consumers that poll rather than subscribe.
+  connectStatus(): ConnectStatus {
+    return this.connStatus;
+  }
+
+  // Arm the "the robot never answered" deadline. Called when we enter `waiting`. NOTE this does
+  // NOT stop the 2 s 'ready' retry loop — a robot that powers on two minutes late still connects
+  // by itself. The deadline only governs when we admit to the operator that nothing is answering.
+  private armWaitDeadline() {
+    if (this.waitTimer) clearTimeout(this.waitTimer);
+    this.waitTimer = setTimeout(() => {
+      this.waitTimer = null;
+      if (this.stopped || this.connected) return;
+      if (this.connStatus.phase !== "waiting") return; // an offer already moved us on
+      this.log("no answer from the robot after " + Math.round(WAIT_FOR_ROBOT_MS / 1000) + "s");
+      this.setPhase("failed", "robot_not_responding");
+    }, WAIT_FOR_ROBOT_MS);
+  }
+
+  private clearWaitDeadline() {
+    if (this.waitTimer) { clearTimeout(this.waitTimer); this.waitTimer = null; }
+  }
+  private clearNackTimer() {
+    if (this.nackFailTimer) { clearTimeout(this.nackFailTimer); this.nackFailTimer = null; }
+  }
+
   // ---- lifecycle -----------------------------------------------------------
   async start() {
     this.stopped = false;
+    this.setPhase("joining");
     if (this.o.forceRelay && !this.o.turnUrls.length) {
       this.log("force relay is on but no TURN URL set — connect will fail");
     }
@@ -957,6 +1205,13 @@ export class RemoteTeleop {
       // a fresh offer => a fresh peer connection (handles robot restarts / reconnects)
       onSdp: async (payload) => {
         if (!payload || payload.type !== "offer") return;
+        // The robot answered — whatever else goes wrong from here, it is NOT absent, so the
+        // "nobody is home" deadline is void, and any nack we were confirming was the expected
+        // pre-auth transient (we're being offered a session = authorized).
+        this.clearWaitDeadline();
+        this.clearNackTimer();
+        this.setPhase("negotiating");
+        try {
         this.log("offer received; building fresh peer + answering...");
         const pc = this.freshPeer();
         await pc.setRemoteDescription({ type: "offer", sdp: payload.sdp });
@@ -984,6 +1239,14 @@ export class RemoteTeleop {
         // If a call was already joined before (re)connect, re-wire mic/cam onto this fresh
         // peer's transceivers. Pure replaceTrack — no renegotiation (R-X.1).
         this.attachLocalMedia();
+        } catch (e) {
+          // This whole body runs inside a signaling event callback, so a throw here used to
+          // become an unhandled rejection: the operator saw the session simply stop, with no
+          // error anywhere. Surface it instead.
+          const msg = (e as Error).message;
+          this.log("negotiation failed: " + msg);
+          this.setPhase("failed", "negotiation_failed", msg);
+        }
       },
 
       onIce: async (payload) => {
@@ -1007,12 +1270,59 @@ export class RemoteTeleop {
         this.sendReady();
       },
 
+      // The robot refused our access code. Report it immediately — no point waiting out the
+      // deadline, the answer won't change. Advisory (a nack is forgeable by anyone in the room),
+      // so it only picks the error copy; it never grants or denies anything.
+      onNack: (payload) => {
+        if (this.connected) return; // a live session ignores late/stray nacks
+        if (payload?.reason && payload.reason !== "unauthorized") {
+          this.log("robot refused the session: " + payload.reason);
+          this.clearWaitDeadline();
+          this.setPhase("failed", "session_rejected", payload.reason);
+          return;
+        }
+        // A nack to our FIRST 'ready' is expected, not a bad code. Supabase broadcasts aren't
+        // retained, so we join without the robot's nonce and our first 'ready' goes out mac-less
+        // (curMac === ""); the robot re-announces its nonce, onRobotHere recomputes the mac, and
+        // the retry connects. Treating that transient nack as a failure is what flashed "wrong
+        // access code" on every normal connect. So: never fail on a nack before we've actually
+        // PRESENTED a mac, and even after that, debounce — a nack racing an in-flight authorized
+        // handshake (the offer is seconds behind) is cancelled the moment the offer arrives
+        // (onSdp) or we connect. A genuinely wrong code keeps nacking every 2 s retry, so the
+        // timer still fires.
+        if (!this.curMac) { this.log("ignoring pre-handshake nack (no access code presented yet)"); return; }
+        if (this.nackFailTimer) return; // already confirming; don't reset (let a real bad code fire)
+        this.log("robot refused the access code — confirming…");
+        this.nackFailTimer = setTimeout(() => {
+          this.nackFailTimer = null;
+          if (this.connected) return;
+          this.clearWaitDeadline();
+          this.setPhase("failed", "bad_access_code");
+        }, NACK_CONFIRM_MS);
+      },
+
       onOpen: () => {
         this.connected = false;
         this.sendReady();
         this.log("announced 'ready' — waiting for robot offer");
+        // Only (re)enter `waiting` from a pre-connection phase. onOpen also fires on a mid-session
+        // signaling reconnect, and that must not knock a live session back to "waiting".
+        if (this.connStatus.phase === "joining" || this.connStatus.phase === "failed") {
+          this.setPhase("waiting");
+          this.armWaitDeadline();
+        }
         if (this.retryTimer) clearInterval(this.retryTimer);
         this.retryTimer = setInterval(() => { if (!this.connected) this.sendReady(); }, 2000);
+      },
+
+      // Transport health. Distinct from robot health: this is "can we reach the room at all".
+      // supabase-js retries underneath, so we report the outage but never tear the session down —
+      // if it recovers, onOpen fires again and we go back to waiting for the robot.
+      onState: (state) => {
+        if (state === "error" || state === "timeout") {
+          if (this.connected) return; // a live session rides out a signaling blip; media is P2P
+          this.setPhase("failed", "signaling_unreachable", state);
+        }
       },
     });
 
@@ -1028,12 +1338,19 @@ export class RemoteTeleop {
     this.clipTrack = null; // caller owns the clip track's lifetime; just drop our reference
     this.call = {
       active: false, micMuted: true, micSending: false,
-      robotAudio: false, robotMicLive: false, cameraOn: false,
+      robotAudio: false, robotMicLive: false, robotMicMuted: false, cameraOn: false,
     };
     this.emitCall();
+    // Recorder knowledge is stale once disconnected (auto mode stops on camera
+    // silence anyway) — a fresh session re-probes with record("status").
+    this.recStat = null;
     if (this.retryTimer) { clearInterval(this.retryTimer); this.retryTimer = null; }
     if (this.jogTimer) { clearInterval(this.jogTimer); this.jogTimer = null; }
+    this.clearWaitDeadline();
+    this.clearNackTimer();
     this.latencyProbe?.stop();
+    this.videoLoop?.stop();
+    this.tel.videoNet = null;
     // tell the robot to exit (clean restart) before we tear down
     this.o.signaling.sendBye();
     if (this.pc) { try { this.pc.close(); } catch { /* noop */ } this.pc = null; }
@@ -1044,6 +1361,8 @@ export class RemoteTeleop {
     this.o.onTelemetry({ ...this.tel });
     this.o.onControlActive(false);
     this.o.onConnState("closed");
+    // Back to a clean slate: a deliberate Disconnect must not leave a failure banner on screen.
+    this.setPhase("idle");
   }
 
   // On-demand audio-latency snapshot (R-X.2). Logs + returns the network+jitter-buffer breakdown;
@@ -1067,6 +1386,24 @@ export class RemoteTeleop {
     this.pc = pc;
     this.latencyProbe?.stop();
     this.latencyProbe = new AudioLatencyProbe(pc, (...a) => this.log(...a));
+    // ABR loop (videoQuality.ts): per peer like the latency probe; started on `connected`.
+    // Suspends itself while the encoder is paused (a 0 fps sample there is not congestion).
+    this.videoLoop?.stop();
+    this.videoLoop = new VideoQualityLoop(pc, {
+      sendTarget: (kbps) => this.dcSend({ type: "video", bitrate: kbps }),
+      paused: () => this.videoPaused,
+      onState: (s) => {
+        const prev = this.tel.videoNet?.quality;
+        this.tel.videoNet = s;
+        // Telemetry normally flows at 50 Hz and carries videoNet with it, but when the daemon
+        // is down that stream is silent — emit on the 1 Hz tick so the net chip stays live.
+        this.o.onTelemetry({ ...this.tel });
+        if (s.quality !== prev && (s.quality !== "good" || prev !== undefined)) {
+          this.log(`video link ${s.quality}: loss ${s.lossPct}%, ` +
+            `${s.fps ?? "?"} fps, rtt ${s.rttMs ?? "?"} ms -> target ${s.targetKbps} kbps`);
+        }
+      },
+    });
     this.linkMode = null; // recomputed per connection from the selected candidate pair
     this.tel.linkMode = null;
     pc.ontrack = (ev) => {
@@ -1099,14 +1436,31 @@ export class RemoteTeleop {
       this.o.onConnState(pc.connectionState);
       if (pc.connectionState === "connected") {
         this.connected = true;
+        this.clearWaitDeadline();
+        this.clearNackTimer();
+        this.setPhase("connected");
         if (this.retryTimer) { clearInterval(this.retryTimer); this.retryTimer = null; }
         this.logSelectedPath();
+        this.videoLoop?.start(); // ABR: adapt the robot's encoder to this link from second one
         // Latency harness (R-X.2): with ?audiolatency, log the network+jitter-buffer breakdown
         // of the audio path every few seconds. Works on the M3a uplink today; reused for M3b.
         if (audioLatencyEnabled()) this.latencyProbe?.start();
       } else if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
         this.connected = false; // robot will exit + restart; keep asking for a new offer
         this.latencyProbe?.stop();
+        this.videoLoop?.stop();
+        this.tel.videoNet = null; // stale numbers must not outlive the link they measured
+        // "failed" = ICE could find no working path (NAT/firewall/TURN) — a real, nameable fault.
+        // "disconnected" is often a transient blip that heals itself, so we drop back to `waiting`
+        // (the retry loop below is already asking for a fresh offer) rather than crying failure.
+        if (!this.stopped) {
+          if (pc.connectionState === "failed") {
+            this.setPhase("failed", "ice_failed");
+          } else {
+            this.setPhase("waiting");
+            this.armWaitDeadline();
+          }
+        }
         if (!this.retryTimer && !this.stopped) {
           this.retryTimer = setInterval(() => { if (!this.connected) this.sendReady(); }, 2000);
         }
@@ -1165,7 +1519,7 @@ export class RemoteTeleop {
     if (!this.linkMode) return;
     if (this.controlCh && this.controlCh.readyState === "open") {
       this.dcSend({ type: "link", mode: this.linkMode });
-      this.log("link -> " + this.linkMode + " (daemon watchdog follows ICE path)");
+      this.log("link -> " + this.linkMode);
     }
   }
 
@@ -1216,6 +1570,18 @@ export class RemoteTeleop {
         this.call.robotMicLive = m.robot_mic_live;
         this.emitCall();
       }
+      // Robot-side local mute (W2.5): robots boot muted; surface it so the UI can say
+      // "ask someone at the robot to unmute". Absent on old bridges -> never fires.
+      // Key is robot_LOCAL_mic_muted: plain robot_mic_muted already exists on the
+      // control channel INBOUND (operator-driven robot-mic mute) — different state.
+      if (typeof m.robot_local_mic_muted === "boolean" && m.robot_local_mic_muted !== this.call.robotMicMuted) {
+        this.call.robotMicMuted = m.robot_local_mic_muted;
+        this.emitCall();
+      }
+      // Pack state-of-charge (battery_monitor_integration.md §5): number 0-100, or explicit
+      // null when unknown. Absent on old bridges -> leave the last value untouched.
+      if (typeof m.battery_percent === "number") this.tel.batteryPercent = m.battery_percent;
+      else if (m.battery_percent === null) this.tel.batteryPercent = null;
       this.o.onTelemetry({ ...this.tel });
     } else if (m.type === "perception") {
       this.ingestPerception(m);
@@ -1223,10 +1589,17 @@ export class RemoteTeleop {
       this.ingestActionStatus(m);
     } else if (m.type === "camera_layout") {
       this.ingestCameraLayout(m);
+    } else if (m.type === "daemon_status") {
+      this.ingestDaemonStatus(m);
+    } else if (m.type === "record_status") {
+      this.ingestRecordStatus(m);
     } else if (m.type === "ack") {
       this.ingestAck(m);
     } else if (m.type === "error") {
-      this.log("daemon error: " + JSON.stringify(m));
+      // Human-readable in the session log; the robot's msg carries the remedy for actionable
+      // faults (e.g. startup_positions → "power-cycle the arm"). Persistent outage state is the
+      // daemon_status frame above — this line is the transient event record.
+      this.log(`robot error [${String(m.code ?? "?")}]${m.fatal ? " (fatal)" : ""}: ${String(m.msg ?? "")}`);
     }
   }
 
@@ -1253,6 +1626,7 @@ export class RemoteTeleop {
 
   // Coerce a wire `action_status` frame, cache it as the latest for its id, notify, and resolve a
   // pending awaitAction() on a terminal state (Phase E / G1).
+
   private ingestActionStatus(m: Record<string, unknown>) {
     const st: ActionStatus = {
       action_id: typeof m.action_id === "string" ? m.action_id : "",
@@ -1281,15 +1655,18 @@ export class RemoteTeleop {
     const info = parseAck(m);
     this.ackInfo = info;
     if (!info.accepted) {
-      this.log("DAEMON REJECTED SESSION: " + (info.error ?? "(no reason given)") +
+      this.log("ROBOT REJECTED SESSION: " + (info.error ?? "(no reason given)") +
         " — connection stays up but control frames will be ignored");
+      // The peer is "connected" but the robot will ignore every control frame — without this the
+      // UI reads fully healthy while nothing moves.
+      this.setPhase("failed", "session_rejected", info.error);
     } else if (info.versionMismatch) {
-      this.log(`protocol version mismatch — daemon v${info.protocolVersion}, SDK targets ` +
+      this.log(`protocol version mismatch — robot v${info.protocolVersion}, SDK targets ` +
         `v${NORI_PROTOCOL_VERSION}. Proceeding (unknown frames are ignored by both sides); ` +
         `expect vocabulary gaps, not unsafe behavior.`);
     }
     const d = info.descriptor;
-    this.log("daemon ack: accepted=" + info.accepted +
+    this.log("robot ack: accepted=" + info.accepted +
       (info.protocolVersion !== undefined ? ` protocol=v${info.protocolVersion}` : "") +
       (info.normMode ? ` norm=${info.normMode}` : "") +
       (info.watchdogProfile ? ` watchdog=${info.watchdogProfile.t_warn_ms}/${info.watchdogProfile.t_stop_ms}ms` : "") +
@@ -1313,6 +1690,64 @@ export class RemoteTeleop {
   // The raw composite layout, or null if unknown (single-camera, or not yet received).
   cameraLayoutInfo(): CameraLayout | null {
     return this.cameraLayoutRaw;
+  }
+
+  // Cache + dedupe the bridge's daemon_status health frames (it re-broadcasts every 3 s while
+  // offline because the control channel is unreliable — only transitions reach the callback/log).
+  private ingestDaemonStatus(m: Record<string, unknown>) {
+    // W2.5: the bridge stamps its local-mute state on daemon_status frames too —
+    // telemetry carries it only while the daemon is UP, so without this a boot-muted
+    // robot with a DOWN daemon would render an unmuted-looking call UI (robotAudio
+    // still attaches; media is daemon-independent). Read BEFORE the dedup below:
+    // a mute toggle alone must update the call state even when health is unchanged.
+    if (typeof m.robot_local_mic_muted === "boolean" && m.robot_local_mic_muted !== this.call.robotMicMuted) {
+      this.call.robotMicMuted = m.robot_local_mic_muted;
+      this.emitCall();
+    }
+    const s: DaemonStatus = { state: String(m.state ?? "") };
+    if (typeof m.reason === "string" && m.reason) s.reason = m.reason;
+    if (typeof m.detail === "string" && m.detail) s.detail = m.detail;
+    if (!s.state) return;
+    const prev = this.daemonStat;
+    if (prev && prev.state === s.state && prev.reason === s.reason && prev.detail === s.detail) return;
+    this.daemonStat = s;
+    // Operator-facing log line: no reason code, no raw detail — the on-screen banner carries the
+    // plain-English remedy for the same event.
+    this.log(s.state === "online"
+      ? "Robot motor control connected"
+      : "Robot motor control offline, reconnecting");
+    this.o.onDaemonStatus?.(s);
+  }
+
+  // The latest bridge-reported daemon health, or null if none received yet (pre-2026-07-11
+  // bridge, or the control channel just opened).
+  daemonStatus(): DaemonStatus | null {
+    return this.daemonStat;
+  }
+
+  // W2.11: coerce a record_status reply (fields per rpi5/media/recorder.py _status),
+  // cache it, notify. Replies are direct answers to record() commands — no dedupe
+  // (a repeated "status" probe legitimately returns the same state, and free_gb drifts).
+  private ingestRecordStatus(m: Record<string, unknown>) {
+    const s: RecordState = {
+      ok: m.ok === true,
+      recording: m.recording === true,
+    };
+    if (m.session_open === true) s.sessionOpen = true;
+    if (typeof m.episodes_kept === "number") s.episodesKept = m.episodes_kept;
+    if (typeof m.episode === "string" && m.episode) s.episode = m.episode;
+    if (typeof m.free_gb === "number") s.freeGb = m.free_gb;
+    if (typeof m.error === "string" && m.error) s.error = m.error;
+    this.recStat = s;
+    this.log(s.error ? `recorder: ${s.error}`
+      : s.recording ? `recording ${s.episode ?? ""} (${s.freeGb ?? "?"} GB free)`
+      : "recorder idle");
+    this.o.onRecord?.(s);
+  }
+
+  // The latest recorder reply, or null if none yet (never asked, or a pre-W2.11 robot).
+  recordState(): RecordState | null {
+    return this.recStat;
   }
 
   // A one-line description of the composite layout for the LLM vision prompt, or null if unknown.
@@ -1359,6 +1794,14 @@ export class RemoteTeleop {
   private dcSend(obj: unknown) {
     if (this.controlCh && this.controlCh.readyState === "open") {
       this.controlCh.send(JSON.stringify(obj));
+      const rec = obj as Record<string, unknown>;
+      if (rec && rec.type === "control" && this.o.onControlSent) {
+        try {
+          this.o.onControlSent(rec, Date.now());
+        } catch {
+          // observer must never break the control path
+        }
+      }
     }
   }
 
@@ -1416,7 +1859,12 @@ export class RemoteTeleop {
     if (!ch || ch.readyState !== "open") return;
     if (ch.bufferedAmount > BUFFER_LIMIT) return; // congested -> skip, don't pile up latency
 
-    const leader = this.externalLeader;
+    // While a policy owns the arms via sendAction(), drop the leader's absolute
+    // targets and any held keys: those out-vote the policy at 50 Hz and pin the arm.
+    // We still emit the benign zero-jog heartbeat below (which the daemon does NOT
+    // let cancel an action — see sendAction), so base velocity can't latch and the
+    // control-liveness heartbeat stays fresh. sendAction is the sole arm driver.
+    const leader = this.policyDriving ? null : this.externalLeader;
 
     // VR (or another mapper) owns the stream: send its payload verbatim. It already
     // carries left_arm/right_arm/base/left_lift/right_lift in the daemon's jog vocabulary, so this is
@@ -1437,14 +1885,19 @@ export class RemoteTeleop {
         : {};
     const base: Record<string, number> = {};
     let z = 0;
+    // User keyboard-speed setting: every held key jogs at this fraction of full rate.
+    const sp = this.keyboardSpeed;
     for (const k of this.pressed) {
+      // A policy owns the arms AND the base/lift for the rollout: ignore every held
+      // key so nothing competes with sendAction; the frame stays a pure heartbeat.
+      if (this.policyDriving) continue;
       // While a leader source drives the arms, arm keys are ignored (leader wins on those
       // joints); base + lift keys still apply so the operator drives the base/rails by hand.
-      if (!leader && k in km) { const [d, s] = km[k]; a[d] = s; }
+      if (!leader && k in km) { const [d, s] = km[k]; a[d] = s * sp; }
       // Firmware turns the base opposite our "+angular = left" convention, so negate the
       // angular sign on the wire (keeps BASE_KEYS/legend reading a,j = left, and now true).
-      else if (k in BASE_KEYS) { const [dof, s] = BASE_KEYS[k]; base[dof] = dof === "angular" ? -s : s; }
-      else if (k in ZLIFT_KEYS) z = ZLIFT_KEYS[k];
+      else if (k in BASE_KEYS) { const [dof, s] = BASE_KEYS[k]; base[dof] = (dof === "angular" ? -s : s) * sp; }
+      else if (k in ZLIFT_KEYS) z = ZLIFT_KEYS[k] * sp;
     }
     // Leader mode: arms come from leader_action_deg, so the jog carries only base + lift.
     // Always include a base object (even empty) so the daemon keeps commanding base velocity

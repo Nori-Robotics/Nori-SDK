@@ -9,11 +9,17 @@ export interface IcePayload {
 export interface RobotHerePayload {
     nonce?: string;
 }
+export interface NackPayload {
+    reason?: "unauthorized" | (string & {});
+}
+export type SignalingState = "open" | "error" | "timeout" | "closed";
 export interface SignalingHandlers {
     onSdp: (payload: SdpPayload) => void;
     onIce: (payload: IcePayload) => void;
     onRobotHere: (payload: RobotHerePayload) => void;
+    onNack?: (payload: NackPayload) => void;
     onOpen: () => void;
+    onState?: (state: SignalingState) => void;
 }
 export interface SignalingTransport {
     connect(handlers: SignalingHandlers): Promise<void>;

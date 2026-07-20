@@ -13,7 +13,7 @@
 // Control map (v1 — exactly the keyboard DOF, per §e "one canonical command set"):
 //   each hand:  grip = CLUTCH (squeeze to move)   trigger = that arm's gripper
 //               move/tilt/twist the controller -> that arm's x/y/pitch/roll + shoulder_pan
-//   each hand:  A/X = that arm's lift UP            B/Y = that arm's lift DOWN
+//   each hand:  B/Y = that arm's lift UP            A/X = that arm's lift DOWN
 //   right only: thumbstick = base drive             thumbstick-press (hold 1.5s) = reset latch
 //   left only:  thumbstick-press = E-STOP (latches + re-clutch) (R13: the operator is
 //               in-headset seeing live video, satisfying the confirmation gate)
@@ -22,8 +22,12 @@
 //               with the right controller. It's hand-anchored so it's always reachable even
 //               after the operator turns around; poke (not ray+trigger) because both triggers
 //               are already the grippers. -> VrSession.recenter().
+//   Record training dataset = an IN-VR poke panel stacked above the sensitivity panel on the
+//               RIGHT wrist (glance the right controller, poke with the left tip). No physical
+//               button is spent — every trigger/grip/face button is already a robot DOF.
 import * as THREE from "three";
-import { VrJogMapper } from "./vr";
+import { VrJogMapper, resolveTuning } from "./vr";
+import { buildRobotModel } from "./robot-model";
 const RESET_HOLD_MS = 1500;
 // Recenter is triggered by an in-VR button anchored above the LEFT controller, poked with
 // the right controller — see the recenter-button fields + updateRecenterButton() below.
@@ -31,14 +35,110 @@ const PANEL_DIST = 2.0; // metres in front of the operator the panel cluster sit
 // Uniform shrink applied to the whole in-VR UI (video + HUD panel cluster + recenter button).
 // 0.8 = 80% of the original size; distance/anchoring are unchanged, panels just read smaller.
 const UI_SCALE = 0.8;
+// X shift applied to every cluster child (video, HUD, robot). The group ORIGIN is what
+// recenter puts dead ahead, but the content spans −0.8 (video's left edge) .. ~+1.85
+// (robot's far side) in group-local units — so without this, the operator faces the
+// video's center and the telemetry + robot hang far off to the right. −0.5 puts the
+// cluster's visual midpoint (not the video's) on the gaze line.
+const CLUSTER_X = -0.5;
+// The 3D robot schematic (C6), mounted to the RIGHT of the telemetry HUD so the instruments
+// read left-to-right: video | telemetry | robot. Unlike the video/HUD panels this is NOT a
+// textured plane — it's the real articulated model in the scene, so it has genuine stereo
+// depth: lean or step sideways and you see around it.
+//   X — HUD spans 0.85..1.35 (0.5 wide at x=1.10); this sits just outboard of it. (Both
+//       pulled inboard 2026-07-16 with the HUD shrink, so the whole cluster reads narrower.)
+//       All cluster x positions (video, HUD, this) get CLUSTER_X added at mount so the
+//       cluster centers on the gaze line — these constants stay in video-centered coords.
+//   Y — the model stands on y=0 and is ~1.5 units tall centred ~1.08, so scaling by
+//       ROBOT_SCALE and dropping it by ROBOT_Y centres it vertically on the panel row.
+//   Z — pushed toward the operator, OFF the panel plane, so it reads as a hologram in front
+//       of the instruments rather than a sticker on them (+Z is toward the viewer after
+//       recenter — see serviceRecenter).
+//   YAW — the model faces +Z (at the operator); this yaws it to the same 3/4 view the desktop
+//       card frames, so you see the front and one flank instead of a flat head-on silhouette.
+const ROBOT_X = 1.55;
+const ROBOT_Y = -0.96;
+const ROBOT_Z = 0.35;
+const ROBOT_SCALE = 0.7;
+const ROBOT_YAW = -0.6;
+// Turntable spin: the LEFT thumbstick's X axis yaws the 3D robot so the operator can look at a
+// pose from any side. That stick's axes are the only unbound input left on either controller
+// (its PRESS is E-STOP, but the axes were unused; the base drive is on the RIGHT stick), which
+// is why it wins over a point-and-grab: grip/trigger/A-X/B-Y are all bound to real robot motion,
+// so "grab" would have to borrow a button that commands the arm. Push right = the robot's front
+// swings right, like spinning a turntable. Rate is per-SECOND (scaled by real frame dt) so the
+// feel doesn't change between a 72 Hz and a 90 Hz headset.
+const ROBOT_SPIN_DEADZONE = 0.15; // ignore stick slop / resting thumb
+const ROBOT_SPIN_RATE = 2.2; // rad/s at full deflection (~2.9 s for a full turn)
+// The same stick's Y axis pushes/pulls the whole UI cluster (video + HUD + 3D robot) along
+// the head→panels line — stick up = further away, down = closer (matches the right stick's
+// up-is-forward). Complements recenter, which re-AIMS the cluster; the chosen distance
+// survives recenter (serviceRecenter reads panelDist).
+const PANEL_DIST_RATE = 1.2; // m/s at full deflection
+const PANEL_DIST_MIN = 0.9; // never pulled into the operator's face
+const PANEL_DIST_MAX = 4.0;
+// Controls cheat-sheet: a card anchored to the left controller, revealed by GLANCING at it —
+// rotate your wrist so the controller's face turns toward you, like checking a watch. Hidden the
+// rest of the time, so it costs no screen space during teleop and spends no button.
+//
+// The test is the dot product of the controller's local UP axis with the direction from the
+// controller to the head: hand held out to drive -> up axis points at the ceiling, dot ~0;
+// wrist rolled toward your face -> up axis swings toward you, dot -> 1. SHOW/HIDE differ
+// (hysteresis) so a hand hovering exactly at the threshold can't strobe the card.
+const CARD_UP = 0.17; // metres above the left controller — clear of the Recenter button (0.06)
+const CARD_W = 0.19;
+const CARD_H = 0.152; // 1.25 aspect, matches the 640x512 canvas
+const CARD_SHOW_DOT = 0.6;
+const CARD_HIDE_DOT = 0.45;
+const CARD_FADE_PER_S = 8; // opacity units/sec — fades instead of popping
 // Recenter poke button geometry (metres). The button floats this far above the left
 // controller, and fires when the right controller tip enters POKE_FIRE_R of it; it must
 // then leave POKE_REARM_R before it can fire again (hysteresis, no repeat-fire). NEAR_R
 // just drives the highlight.
-const RC_BTN_UP = 0.09; // button offset above the left controller
+const RC_BTN_UP = 0.06; // button offset above the left controller — low enough that its
+// top edge clears the controls card's bottom (card spans
+// 0.17 ± 0.061 scaled; at 0.09 the two overlapped)
 const RC_POKE_FIRE_R = 0.045;
 const RC_POKE_REARM_R = 0.08;
 const RC_POKE_NEAR_R = 0.11;
+// In-VR sensitivity panel — the wrist-glance card's mirror image, on the RIGHT wrist:
+// glance at the right controller (its clutch released) and a two-row −/+ panel appears
+// above it; poke a zone with the LEFT controller tip to step the value. Hidden while the
+// right clutch is engaged, since driving rolls that wrist through the glance pose
+// constantly. Changes apply on the next mapped frame and are reported via onTuningChange
+// so the page can persist them alongside its sliders.
+const TUNE_UP = 0.17; // metres above the right controller (mirrors CARD_UP)
+// Panel sized so its 640x256 canvas lands at ~3200 px/m — the same pixel density as the
+// controls card (640 px over 0.19 m), so the two wrist surfaces read at one text size.
+// Width is deliberately generous relative to the two rows: it spreads the − / + poke
+// zones apart (they were too easy to cross-poke at 0.16 m; 2026-07-16).
+const TUNE_W = 0.2;
+const TUNE_H = 0.08; // 2.5:1 aspect, matches the 640x256 canvas
+const TUNE_SENS_STEP = 0.25; // one poke, on the web slider's 0.25..2 range
+const TUNE_GRIP_STEP = 0.1; // one poke, on the web slider's 0.05..1 range
+// Poke zones in the panel plane's LOCAL metres (x right, y up, origin center):
+// row 0 = motion sensitivity, row 1 = gripper-open rate; dir = which way the poke steps.
+const TUNE_ZONES = [
+    { x: -(TUNE_W / 2 - 0.03), y: TUNE_H / 4, row: 0, dir: -1 },
+    { x: TUNE_W / 2 - 0.03, y: TUNE_H / 4, row: 0, dir: 1 },
+    { x: -(TUNE_W / 2 - 0.03), y: -TUNE_H / 4, row: 1, dir: -1 },
+    { x: TUNE_W / 2 - 0.03, y: -TUNE_H / 4, row: 1, dir: 1 },
+];
+// In-VR "Record dataset" poke panel — the sensitivity panel's upstairs neighbour on the
+// RIGHT wrist (glance at the right controller, poke a button with the LEFT tip). It sits
+// ABOVE the tune panel because the left wrist is already full (controls card + Recenter
+// button), so the right wrist carries both meta surfaces: tune below, record above. It's a
+// session-management surface (Start session -> Record/Stop episode -> Finish), not a driving
+// control, so it deliberately spends NO trigger/grip/face button — every one of those is a
+// real robot DOF. State + count come straight from RemoteTeleop.recordState(); a poke calls
+// RemoteTeleop.record(...). See docs/offline_recorder_design.md for the session/episode model.
+const REC_UP = 0.30; // metres above the right controller (stacked clear of TUNE_UP=0.17)
+const REC_W = 0.21;
+const REC_H = 0.14; // 1.5:1, matches the 480x320 canvas
+const REC_POKE_DEPTH = 0.035; // left tip within this of the panel plane (local m) = a poke
+const REC_POKE_MARGIN = 0.012; // slack added around each button's rect for the hit-test
+const REC_REARM_DEPTH = 0.07; // tip must pull this far off the plane before it can fire again
+const REC_RECONCILE_MS = 1200; // ignore robot state this long after a local poke (optimistic UI)
 // gripper Present_Current -> rumble. Raw sign-magnitude ints; tune on hardware.
 // Tuned stronger 2026-07-02 (was hard to feel): lower the contact threshold, reach full
 // rumble much sooner, and floor any real contact at HAPTIC_MIN so light grips still register.
@@ -56,19 +156,20 @@ const HAPTIC_BASE_RISE = 3; // baseline upward creep (units/s): slow enough that
 // absorb idle-current drift
 const HAPTIC_PULSE_MS = 100; // longer pulse per frame -> a more solid, continuous buzz (was 60)
 const CURRENT_FULL = 600; // Present_Current mapped to a full HUD bar (matches TeleopStatus)
-const TEL_STALE_MS = 1500; // no telemetry for this long -> HUD shows "stale" (matches remote.tsx)
+const TEL_STALE_MS = 1500; // no telemetry for this long -> HUD control row reads "disconnected"
 const HUD_REDRAW_MS = 250; // repaint cadence so staleness updates even without new frames
 // Dual-arm default: grip=clutch, trigger=gripper. Each controller's face buttons drive its
-// OWN arm's lift (left X/Y = left lift up/down; right A/B = right lift up/down). E-STOP and
+// OWN arm's lift (left Y/X = left lift up/down; right B/A = right lift up/down — the UPPER
+// face button raises, the LOWER one lowers, matching the physical layout). E-STOP and
 // reset moved onto the thumbstick PRESS (index 3) to free the face buttons for the lifts:
 // left stick-press = E-STOP; right stick-press (hold 1.5s) = reset.
 export const DEFAULT_BINDINGS = {
     clutch: { left: 1, right: 1 },
     gripper: { left: 0, right: 0 },
-    leftLiftUp: { hand: "left", index: 4 }, // X
-    leftLiftDown: { hand: "left", index: 5 }, // Y
-    rightLiftUp: { hand: "right", index: 4 }, // A
-    rightLiftDown: { hand: "right", index: 5 }, // B
+    leftLiftUp: { hand: "left", index: 5 }, // Y (upper button)
+    leftLiftDown: { hand: "left", index: 4 }, // X (lower button)
+    rightLiftUp: { hand: "right", index: 5 }, // B (upper button)
+    rightLiftDown: { hand: "right", index: 4 }, // A (lower button)
     estop: { hand: "left", index: 3 }, // left thumbstick press
     reset: { hand: "right", index: 3 }, // right thumbstick press (hold)
 };
@@ -89,6 +190,16 @@ export class VrSession {
         // The video + HUD panels live in one group so recenter moves them together and later
         // displays (multi-camera feeds, 3D cube view) can be added as more children.
         this.panelGroup = null;
+        // The C6 robot schematic — a real articulated three.js model (not a texture), re-posed from
+        // telemetry every frame. Same builder the desktop card mounts, so the two can't drift.
+        this.robot = null;
+        // Operator-controlled turntable yaw of that model (left thumbstick X), radians. Survives
+        // recenter: it's relative to the panel group, so re-aiming the cluster doesn't spin the robot.
+        this.robotYaw = ROBOT_YAW;
+        this.lastFrameAt = 0; // for the per-second spin rate
+        // Operator-chosen distance of the panel cluster (left stick Y). Recenter re-aims the
+        // cluster but keeps this distance.
+        this.panelDist = PANEL_DIST;
         this.session = null;
         this.currents = {};
         // Per-gripper adaptive idle-current baseline for haptics (see applyHaptics).
@@ -98,6 +209,7 @@ export class VrSession {
         // with the same stats, uploaded as a texture on a panel beside the video.
         this.tel = null;
         this.lastTelAt = 0;
+        this.motorsOnline = true;
         this.hudCanvas = null;
         this.hudCtx = null;
         this.hudTexture = null;
@@ -112,11 +224,56 @@ export class VrSession {
         this.rcBtnCanvas = null;
         this.rcBtnCtx = null;
         this.rcBtnTexture = null;
+        // Wrist-glance controls card (left controller). Static art — painted once; only its opacity
+        // changes, so there's no per-frame canvas upload.
+        this.card = null;
+        this.cardCanvas = null;
+        this.cardCtx = null;
+        this.cardTexture = null;
+        this.cardMat = null;
+        this.cardShown = false; // hysteresis latch: is the glance currently "open"?
+        this.cardOpacity = 0;
         this.rcPoked = false; // armed-state: true between fire and re-arm (hysteresis)
         this.rcBtnHot = false; // last painted highlight state (redraw only on change)
+        this.tuneBtn = null;
+        this.tuneCanvas = null;
+        this.tuneCtx = null;
+        this.tuneTexture = null;
+        this.tuneMat = null;
+        this.tuneShown = false; // glance hysteresis latch (mirrors cardShown)
+        this.tuneOpacity = 0;
+        this.tunePoked = false; // between fire and re-arm (mirrors rcPoked)
+        this.tuneHotZone = -1; // highlighted zone index, -1 = none (redraw only on change)
+        // In-VR record-dataset panel (right-wrist glance, above the tune panel — see REC_* consts).
+        // Same canvas-texture-on-a-plane + glance/poke machinery as the tune panel; the zones and
+        // artwork are STATE-driven (idle / session / recording) so it repaints on state or highlight
+        // change. Local phase is optimistic — updated the instant a poke is sent, then reconciled
+        // with the robot's authoritative RecordState once replies resume (see REC_RECONCILE_MS).
+        this.recBtn = null;
+        this.recCanvas = null;
+        this.recCtx = null;
+        this.recTexture = null;
+        this.recMat = null;
+        this.recShown = false; // glance hysteresis latch (mirrors tuneShown)
+        this.recOpacity = 0;
+        this.recPoked = false; // between fire and re-arm (mirrors tunePoked)
+        this.recHotZone = ""; // highlighted zone id, "" = none (redraw only on change)
+        this.recPhase = "idle";
+        this.recKept = 0; // episodes kept in the open session (optimistic + reconciled)
+        this.recTask = ""; // this session's grouping label (option C: "VR session <stamp>")
+        this.recActedAt = 0; // performance.now() of the last local poke (reconcile grace)
+        this.recDrawSig = ""; // last-painted signature (phase|kept|hot) — repaint only on change
         this.running = false;
         this.o = opts;
         this.b = opts.bindings ?? DEFAULT_BINDINGS;
+        this.tuning = resolveTuning(opts.tuning);
+        this.mapper.setTuning(this.tuning);
+    }
+    // Live sensitivity updates while in VR (the page's sliders call this on change).
+    setTuning(t) {
+        this.tuning = resolveTuning(t);
+        this.mapper.setTuning(this.tuning);
+        this.drawTunePanel(); // keep the in-VR panel's numbers in sync with the web sliders
     }
     static async isSupported() {
         const xr = navigator.xr;
@@ -140,6 +297,13 @@ export class VrSession {
     setTelemetry(t) {
         this.tel = t;
         this.lastTelAt = performance.now();
+    }
+    // The robot's motor-control health (the page wires RemoteTeleop.onDaemonStatus here). The HUD's
+    // "control" row needs it for the same reason the 2D chip does: the command channel can be open
+    // and the media bridge healthy while motor control behind them is dead. Default true so a robot
+    // that never reports health isn't shown as offline — telemetry staleness still catches that.
+    setMotorsOnline(ok) {
+        this.motorsOnline = ok;
     }
     // Force a fresh squeeze before driving resumes (after any safe-hold). The page calls
     // this when the link drops; E-STOP calls it inline.
@@ -178,10 +342,12 @@ export class VrSession {
         texture.colorSpace = THREE.SRGBColorSpace;
         this.texture = texture;
         const video = new THREE.Mesh(new THREE.PlaneGeometry(1.6, 1.2), new THREE.MeshBasicMaterial({ map: texture, toneMapped: false, side: THREE.DoubleSide }));
-        video.position.set(0, 0, 0);
+        video.position.set(CLUSTER_X, 0, 0);
         group.add(video);
-        // Telemetry HUD panel to the right of the video (0.6 m wide, same height). A 2D canvas
-        // painted with the keyboard stats + grip-force bars, uploaded as a CanvasTexture.
+        // Telemetry HUD panel to the right of the video. 0.5x1.0 m — a uniform shrink of the
+        // original 0.6x1.2 (same 0.5 aspect as the 512x1024 canvas, so nothing distorts; text
+        // reads ~17% smaller) to keep the whole 2D cluster narrower. A 2D canvas painted with
+        // the keyboard stats + grip-force bars, uploaded as a CanvasTexture.
         const hudCanvas = document.createElement("canvas");
         hudCanvas.width = 512;
         hudCanvas.height = 1024; // 0.5 aspect -> matches a 0.6×1.2 panel
@@ -190,10 +356,24 @@ export class VrSession {
         const hudTexture = new THREE.CanvasTexture(hudCanvas);
         hudTexture.colorSpace = THREE.SRGBColorSpace;
         this.hudTexture = hudTexture;
-        const hud = new THREE.Mesh(new THREE.PlaneGeometry(0.6, 1.2), new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true, side: THREE.DoubleSide }));
-        hud.position.set(1.15, 0, 0); // right of the 1.6 m video panel, small gap
+        const hud = new THREE.Mesh(new THREE.PlaneGeometry(0.5, 1.0), new THREE.MeshBasicMaterial({ map: hudTexture, transparent: true, side: THREE.DoubleSide }));
+        hud.position.set(1.1 + CLUSTER_X, 0, 0); // right of the 1.6 m video panel, small gap
         group.add(hud);
         this.drawHud(); // paint once so it's not blank before the first telemetry frame
+        // The 3D robot schematic, right of the HUD. A genuine articulated model in the scene —
+        // stereo depth, parallax, walk-around — not a 2D viewport rendered to a texture. Its grid
+        // is off: a 3-unit floor plane looks right in the desktop card but would punch through the
+        // panel cluster here. Lit by the directional light added below (the hemisphere light alone
+        // renders the MeshStandardMaterial links flat and shapeless).
+        const robot = buildRobotModel({ showGrid: false });
+        robot.root.position.set(ROBOT_X + CLUSTER_X, ROBOT_Y, ROBOT_Z);
+        robot.root.rotation.set(0, ROBOT_YAW, 0);
+        robot.root.scale.setScalar(ROBOT_SCALE);
+        group.add(robot.root);
+        this.robot = robot;
+        const keyLight = new THREE.DirectionalLight(0xffffff, 1.2);
+        keyLight.position.set(2, 4, 3); // same key as the desktop card, so the model shades alike
+        scene.add(keyLight);
         // In-VR "Recenter" poke button — a small labeled plane added straight to the SCENE (not
         // the panel group): it's hand-anchored (repositioned each frame above the left controller)
         // so it stays reachable no matter where the operator turns. depthTest off + a high render
@@ -215,6 +395,69 @@ export class VrSession {
         scene.add(rcBtn);
         this.rcBtn = rcBtn;
         this.drawRecenterButton(false);
+        // Controls cheat-sheet, hand-anchored like the Recenter button (same reason: it has to stay
+        // reachable/readable wherever the operator turns) but revealed only on a wrist glance. Starts
+        // fully transparent — updateControlsCard() fades it in.
+        const cardCanvas = document.createElement("canvas");
+        cardCanvas.width = 640;
+        cardCanvas.height = 512;
+        this.cardCanvas = cardCanvas;
+        this.cardCtx = cardCanvas.getContext("2d");
+        const cardTex = new THREE.CanvasTexture(cardCanvas);
+        cardTex.colorSpace = THREE.SRGBColorSpace;
+        this.cardTexture = cardTex;
+        const cardMat = new THREE.MeshBasicMaterial({
+            map: cardTex, transparent: true, opacity: 0, side: THREE.DoubleSide, depthTest: false,
+        });
+        this.cardMat = cardMat;
+        const card = new THREE.Mesh(new THREE.PlaneGeometry(CARD_W, CARD_H), cardMat);
+        card.renderOrder = 998; // above the panels, just under the Recenter button
+        card.visible = false;
+        card.scale.setScalar(UI_SCALE);
+        scene.add(card);
+        this.card = card;
+        this.drawControlsCard(); // static content — painted once, never repainted
+        // Sensitivity tuning panel — the card's right-wrist mirror (see TUNE_* constants).
+        const tuneCanvas = document.createElement("canvas");
+        tuneCanvas.width = 640;
+        tuneCanvas.height = 256;
+        this.tuneCanvas = tuneCanvas;
+        this.tuneCtx = tuneCanvas.getContext("2d");
+        const tuneTex = new THREE.CanvasTexture(tuneCanvas);
+        tuneTex.colorSpace = THREE.SRGBColorSpace;
+        this.tuneTexture = tuneTex;
+        const tuneMat = new THREE.MeshBasicMaterial({
+            map: tuneTex, transparent: true, opacity: 0, side: THREE.DoubleSide, depthTest: false,
+        });
+        this.tuneMat = tuneMat;
+        const tuneBtn = new THREE.Mesh(new THREE.PlaneGeometry(TUNE_W, TUNE_H), tuneMat);
+        tuneBtn.renderOrder = 998; // same layer as the controls card
+        tuneBtn.visible = false;
+        tuneBtn.scale.setScalar(UI_SCALE);
+        scene.add(tuneBtn);
+        this.tuneBtn = tuneBtn;
+        this.drawTunePanel();
+        // Record-dataset panel — stacked above the tune panel on the right wrist (REC_* consts).
+        // Same hand-anchored, wrist-glance, poke-to-act pattern; its face is state-driven art.
+        const recCanvas = document.createElement("canvas");
+        recCanvas.width = 480;
+        recCanvas.height = 320;
+        this.recCanvas = recCanvas;
+        this.recCtx = recCanvas.getContext("2d");
+        const recTex = new THREE.CanvasTexture(recCanvas);
+        recTex.colorSpace = THREE.SRGBColorSpace;
+        this.recTexture = recTex;
+        const recMat = new THREE.MeshBasicMaterial({
+            map: recTex, transparent: true, opacity: 0, side: THREE.DoubleSide, depthTest: false,
+        });
+        this.recMat = recMat;
+        const recBtn = new THREE.Mesh(new THREE.PlaneGeometry(REC_W, REC_H), recMat);
+        recBtn.renderOrder = 998; // same layer as the controls card / tune panel
+        recBtn.visible = false;
+        recBtn.scale.setScalar(UI_SCALE);
+        scene.add(recBtn);
+        this.recBtn = recBtn;
+        this.drawRecordPanel();
         const session = await xr.requestSession(mode, {
             optionalFeatures: ["local-floor", "bounded-floor"],
         });
@@ -222,15 +465,24 @@ export class VrSession {
         session.addEventListener("end", () => this.handleEnd());
         await renderer.xr.setSession(session);
         this.running = true;
+        // Seed the record panel with the robot's current recorder state (it may already have a
+        // session open from the desktop card) so it opens on the right face, not a stale "idle".
+        try {
+            this.o.teleop.record("status");
+        }
+        catch { /* channel not up yet — reconciles later */ }
         // Auto-recenter on the first frame with a viewer pose: the panel spawn pose assumes the
         // operator faces the reference space's forward, which is only sometimes true. This makes
         // session start and mid-session recenter the same path — panel AND control frame align
         // with wherever the operator is actually facing when the session begins.
         this.recenterPending = true;
         this.o.onLog(`${mode === "immersive-ar" ? "AR (passthrough)" : "VR"} session started — ` +
-            "grip to engage clutch, A/X & B/Y = that arm's lift up/down, "
+            "grip to engage clutch, B/Y & A/X = that arm's lift up/down, "
+            + "right stick = drive the base, left stick = spin the 3D robot (↔) "
+            + "/ move the UI closer-further (↕), "
             + "left stick-press = E-STOP, hold right stick-press = reset, "
-            + "poke the Recenter button above your left hand to recenter the view");
+            + "poke the Recenter button above your left hand to recenter the view, "
+            + "glance at your right wrist for sensitivity tuning + recording controls");
         renderer.setAnimationLoop((_t, frame) => this.onXRFrame(frame));
     }
     async stop() {
@@ -263,11 +515,19 @@ export class VrSession {
         this.texture?.dispose();
         this.hudTexture?.dispose();
         this.rcBtnTexture?.dispose();
+        this.cardTexture?.dispose();
+        this.tuneTexture?.dispose();
+        this.recTexture?.dispose();
+        this.robot?.dispose();
         this.renderer = null;
         this.scene = null;
         this.camera = null;
         this.texture = null;
         this.panelGroup = null;
+        this.robot = null;
+        this.robotYaw = ROBOT_YAW; // next session starts from the default 3/4 view
+        this.panelDist = PANEL_DIST; // and from the default cluster distance
+        this.lastFrameAt = 0;
         this.hudTexture = null;
         this.hudCanvas = null;
         this.hudCtx = null;
@@ -275,9 +535,40 @@ export class VrSession {
         this.rcBtnTexture = null;
         this.rcBtnCanvas = null;
         this.rcBtnCtx = null;
+        this.card = null;
+        this.cardCanvas = null;
+        this.cardCtx = null;
+        this.cardTexture = null;
+        this.cardMat = null;
+        this.cardShown = false;
+        this.cardOpacity = 0;
         this.rcPoked = false;
         this.rcBtnHot = false;
+        this.tuneBtn = null;
+        this.tuneCanvas = null;
+        this.tuneCtx = null;
+        this.tuneTexture = null;
+        this.tuneMat = null;
+        this.tuneShown = false;
+        this.tuneOpacity = 0;
+        this.tunePoked = false;
+        this.tuneHotZone = -1;
+        this.recBtn = null;
+        this.recCanvas = null;
+        this.recCtx = null;
+        this.recTexture = null;
+        this.recMat = null;
+        this.recShown = false;
+        this.recOpacity = 0;
+        this.recPoked = false;
+        this.recHotZone = "";
+        this.recPhase = "idle";
+        this.recKept = 0;
+        this.recTask = "";
+        this.recActedAt = 0;
+        this.recDrawSig = "";
         this.tel = null;
+        this.motorsOnline = true;
         this.session = null;
         this.o.onLog("VR session ended");
         this.o.onEnd();
@@ -288,6 +579,11 @@ export class VrSession {
         const camera = this.camera;
         if (!renderer || !scene || !camera)
             return;
+        // Seconds since the previous XR frame. Clamped so a hitch (or the headset being taken off
+        // and put back on) can't integrate one enormous step and fling the robot's spin.
+        const nowMs = performance.now();
+        const dt = this.lastFrameAt ? Math.min(0.1, (nowMs - this.lastFrameAt) / 1000) : 0;
+        this.lastFrameAt = nowMs;
         if (frame) {
             const refSpace = renderer.xr.getReferenceSpace();
             const session = renderer.xr.getSession();
@@ -311,6 +607,36 @@ export class VrSession {
                     rightLiftDown: this.buttonDown(this.b.rightLiftDown, sources),
                     estop: this.buttonDown(this.b.estop, sources),
                 };
+                // Left stick X spins the 3D robot (see ROBOT_SPIN_RATE). Read straight off the sampled
+                // frame — the mapper never consumes this axis, so it drives nothing on the real robot.
+                const spinX = vrFrame.left?.thumbstick.x ?? 0;
+                if (Math.abs(spinX) > ROBOT_SPIN_DEADZONE) {
+                    this.robotYaw += spinX * ROBOT_SPIN_RATE * dt;
+                }
+                // Left stick Y pushes/pulls the whole UI cluster (up = away, like the right stick's
+                // up-is-forward). Adjusts from the cluster's ACTUAL current distance — not the
+                // stored one — so it never snaps if the operator has walked since placing it.
+                const distY = vrFrame.left?.thumbstick.y ?? 0;
+                if (Math.abs(distY) > ROBOT_SPIN_DEADZONE && this.panelGroup) {
+                    const head = new THREE.Vector3();
+                    renderer.xr.getCamera().getWorldPosition(head);
+                    const dir = this.panelGroup.position.clone().sub(head);
+                    dir.y = 0;
+                    if (dir.lengthSq() > 1e-6) {
+                        const cur = dir.length();
+                        dir.normalize();
+                        this.panelDist = Math.min(PANEL_DIST_MAX, Math.max(PANEL_DIST_MIN, cur - distY * PANEL_DIST_RATE * dt));
+                        this.panelGroup.position.setX(head.x + dir.x * this.panelDist);
+                        this.panelGroup.position.setZ(head.z + dir.z * this.panelDist);
+                    }
+                }
+                // Feed the opening ramp the arms' current jaw positions (telemetry gripper.pos,
+                // 0 = closed .. 100 = open — same keys the 3D schematic's jaws read).
+                const gPos = (k) => {
+                    const v = this.tel?.state[k];
+                    return typeof v === "number" ? v : null;
+                };
+                this.mapper.setGripperPos(gPos("left_arm_gripper.pos"), gPos("right_arm_gripper.pos"));
                 const res = this.mapper.map(vrFrame);
                 // null = nothing engaged this frame -> hand the stream back to the keyboard.
                 this.o.teleop.setExternalJog(res.jog);
@@ -322,10 +648,24 @@ export class VrSession {
                 const resetHeld = this.buttonDown(this.b.reset, sources);
                 this.handleResetHold(resetHeld); // sustained hold of the reset button = reset_latch
                 this.updateRecenterButton(vrFrame); // in-VR poke button -> recenter()
+                this.updateControlsCard(vrFrame, dt); // wrist-glance controls cheat-sheet
+                this.updateTunePanel(vrFrame, dt); // right-wrist glance sensitivity panel
+                this.updateRecordPanel(vrFrame, dt); // right-wrist glance record-dataset panel
                 if (this.recenterPending)
                     this.serviceRecenter(frame, refSpace);
                 this.applyHaptics(session);
             }
+        }
+        // Re-pose the 3D robot EVERY frame (unlike the HUD's slow repaint below): it's live motion,
+        // not text, so a 4 Hz cadence would visibly judder. It only writes joint rotations into the
+        // existing scene graph — no allocation, no texture upload — so it's cheap enough to run at
+        // headset rate. VR is dual-arm, so the green highlight tracks the engaged clutch(es)
+        // rather than the keyboard's single "active arm".
+        if (this.robot) {
+            const eng = this.mapper.engagedArms();
+            const highlight = eng.left && eng.right ? "both" : eng.left ? "left" : eng.right ? "right" : "none";
+            this.robot.update(this.tel?.state ?? {}, highlight);
+            this.robot.root.rotation.y = this.robotYaw; // operator turntable (left stick X)
         }
         // Repaint the HUD on a slow cadence (keeps staleness/values fresh without redrawing text
         // every 72–90 Hz frame).
@@ -396,7 +736,9 @@ export class VrSession {
         if (fwd.lengthSq() < 1e-6)
             fwd.set(0, 0, -1); // looking straight up/down -> keep prior facing
         fwd.normalize();
-        group.position.set(p.x + fwd.x * PANEL_DIST, p.y, p.z + fwd.z * PANEL_DIST);
+        // panelDist, not the PANEL_DIST constant: recenter re-aims the cluster but keeps the
+        // distance the operator chose with the left stick.
+        group.position.set(p.x + fwd.x * this.panelDist, p.y, p.z + fwd.z * this.panelDist);
         // Face the operator: rotate the group so its panels' +Z (their front face) points back
         // toward the head, i.e. along -fwd. (yaw only; matches the initial fwd=(0,0,-1) -> yaw 0.)
         const yaw = Math.atan2(-fwd.x, -fwd.z);
@@ -448,6 +790,479 @@ export class VrSession {
             this.rcBtnHot = hot;
             this.drawRecenterButton(hot);
         }
+    }
+    // Anchor + reveal the controls card. Mirrors updateRecenterButton's hand-anchoring, but instead
+    // of a poke test it runs the wrist-glance dot product (see CARD_SHOW_DOT).
+    updateControlsCard(f, dt) {
+        const card = this.card;
+        const mat = this.cardMat;
+        if (!card || !mat)
+            return;
+        const lp = f.left?.position;
+        const lq = f.left?.orientation;
+        if (!lp) {
+            // Left hand not tracked: fade out rather than snapping the card away mid-read.
+            this.cardShown = false;
+        }
+        else {
+            // Float it above the controller in the controller's OWN frame, so it rolls with the wrist.
+            const off = new THREE.Vector3(0, CARD_UP, 0);
+            const q = lq ? new THREE.Quaternion(lq[0], lq[1], lq[2], lq[3]) : null;
+            if (q)
+                off.applyQuaternion(q);
+            card.position.set(lp[0] + off.x, lp[1] + off.y, lp[2] + off.z);
+            const head = new THREE.Vector3();
+            this.renderer?.xr.getCamera().getWorldPosition(head);
+            // Glance test: how much does the controller's up axis point at the head?
+            if (q) {
+                const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+                const toHead = head.clone().sub(card.position).normalize();
+                const facing = up.dot(toHead);
+                // Hysteresis — open above SHOW, stay open until we drop below HIDE.
+                if (!this.cardShown && facing > CARD_SHOW_DOT)
+                    this.cardShown = true;
+                else if (this.cardShown && facing < CARD_HIDE_DOT)
+                    this.cardShown = false;
+            }
+            card.lookAt(head); // billboard, same as the Recenter button
+        }
+        // Fade toward the target so the card doesn't pop in and out as the wrist crosses threshold.
+        const target = this.cardShown ? 1 : 0;
+        const step = CARD_FADE_PER_S * dt;
+        this.cardOpacity =
+            this.cardOpacity < target
+                ? Math.min(target, this.cardOpacity + step)
+                : Math.max(target, this.cardOpacity - step);
+        mat.opacity = this.cardOpacity;
+        card.visible = this.cardOpacity > 0.01; // fully faded -> skip drawing it entirely
+    }
+    // Anchor + reveal the sensitivity panel above the RIGHT controller (the controls card's
+    // mirror image), and step the values when the LEFT controller tip pokes a −/+ zone.
+    updateTunePanel(f, dt) {
+        const btn = this.tuneBtn;
+        const mat = this.tuneMat;
+        if (!btn || !mat)
+            return;
+        const rp = f.right?.position;
+        const rq = f.right?.orientation;
+        if (!rp) {
+            this.tuneShown = false; // right hand not tracked: fade out (mirrors the card)
+        }
+        else {
+            const off = new THREE.Vector3(0, TUNE_UP, 0);
+            const q = rq ? new THREE.Quaternion(rq[0], rq[1], rq[2], rq[3]) : null;
+            if (q)
+                off.applyQuaternion(q);
+            btn.position.set(rp[0] + off.x, rp[1] + off.y, rp[2] + off.z);
+            const head = new THREE.Vector3();
+            this.renderer?.xr.getCamera().getWorldPosition(head);
+            // Same glance test as the controls card, on the other wrist — but never while the
+            // right clutch is engaged: driving rolls that wrist straight through the glance pose.
+            if (this.mapper.engagedArms().right) {
+                this.tuneShown = false;
+            }
+            else if (q) {
+                const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+                const toHead = head.clone().sub(btn.position).normalize();
+                const facing = up.dot(toHead);
+                if (!this.tuneShown && facing > CARD_SHOW_DOT)
+                    this.tuneShown = true;
+                else if (this.tuneShown && facing < CARD_HIDE_DOT)
+                    this.tuneShown = false;
+            }
+            btn.lookAt(head); // billboard, same as the other hand-anchored UI
+        }
+        // Fade like the controls card so it never pops.
+        const target = this.tuneShown ? 1 : 0;
+        const step = CARD_FADE_PER_S * dt;
+        this.tuneOpacity =
+            this.tuneOpacity < target
+                ? Math.min(target, this.tuneOpacity + step)
+                : Math.max(target, this.tuneOpacity - step);
+        mat.opacity = this.tuneOpacity;
+        btn.visible = this.tuneOpacity > 0.01;
+        // Poke test only while the panel is (nearly) fully shown — no blind fires mid-fade.
+        let hot = -1;
+        const lp = f.left?.position;
+        if (btn.visible && this.tuneOpacity > 0.8 && lp) {
+            btn.updateMatrixWorld();
+            const tip = new THREE.Vector3(lp[0], lp[1], lp[2]);
+            let best = -1;
+            let bestD = Infinity;
+            TUNE_ZONES.forEach((z, i) => {
+                const d = tip.distanceTo(btn.localToWorld(new THREE.Vector3(z.x, z.y, 0)));
+                if (d < bestD) {
+                    bestD = d;
+                    best = i;
+                }
+            });
+            if (bestD < RC_POKE_NEAR_R)
+                hot = best;
+            // Same fire/re-arm hysteresis as the Recenter button, against the NEAREST zone only.
+            if (!this.tunePoked && bestD < RC_POKE_FIRE_R) {
+                this.tunePoked = true;
+                this.applyTuneStep(best);
+            }
+            else if (this.tunePoked && bestD > RC_POKE_REARM_R) {
+                this.tunePoked = false;
+            }
+        }
+        if (hot !== this.tuneHotZone) {
+            this.tuneHotZone = hot;
+            this.drawTunePanel();
+        }
+    }
+    // One poke on zone `i`: step that row's value, clamp to the web sliders' ranges, apply
+    // to the mapper, and tell the page so it persists (keeps the 2D sliders in sync too).
+    applyTuneStep(i) {
+        const z = TUNE_ZONES[i];
+        if (!z)
+            return;
+        const t = { ...this.tuning };
+        if (z.row === 0) {
+            t.sensitivity = Math.min(2, Math.max(0.25, t.sensitivity + z.dir * TUNE_SENS_STEP));
+        }
+        else {
+            t.gripperOpenRate = Math.min(1, Math.max(0.05, t.gripperOpenRate + z.dir * TUNE_GRIP_STEP));
+        }
+        // Kill float-step residue (0.35000000000000003) before it reaches the UI/persistence.
+        t.sensitivity = Math.round(t.sensitivity * 100) / 100;
+        t.gripperOpenRate = Math.round(t.gripperOpenRate * 100) / 100;
+        this.tuning = resolveTuning(t);
+        this.mapper.setTuning(this.tuning);
+        this.drawTunePanel();
+        this.o.onLog(`tuning: motion ${Math.round(this.tuning.sensitivity * 100)}% · ` +
+            `grip open ${Math.round(this.tuning.gripperOpenRate * 100)}%`);
+        this.o.onTuningChange?.(this.tuning);
+    }
+    // Paint the sensitivity panel: two rows (motion / grip open), each a − and + zone with
+    // the current value between them. Zone canvas positions derive from TUNE_ZONES so the
+    // hit-test and the artwork can't drift apart.
+    drawTunePanel() {
+        const ctx = this.tuneCtx;
+        const cv = this.tuneCanvas;
+        if (!ctx || !cv)
+            return;
+        const W = cv.width, H = cv.height;
+        // plane-local metres -> canvas px (canvas y grows downward)
+        const px = (x) => (0.5 + x / TUNE_W) * W;
+        const py = (y) => (0.5 - y / TUNE_H) * H;
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(15,23,42,0.92)";
+        this.roundRect(ctx, 4, 4, W - 8, H - 8, 26);
+        ctx.fill();
+        ctx.strokeStyle = "#64748b";
+        ctx.lineWidth = 4;
+        this.roundRect(ctx, 4, 4, W - 8, H - 8, 26);
+        ctx.stroke();
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const rows = [
+            ["motion", this.tuning.sensitivity],
+            ["grip open", this.tuning.gripperOpenRate],
+        ];
+        // Font sizes track the controls card's 28-30px range — at this panel's matched pixel
+        // density that's the same physical text size on both wrists.
+        TUNE_ZONES.forEach((z, i) => {
+            const hot = i === this.tuneHotZone;
+            ctx.fillStyle = hot ? "rgba(34,197,94,0.92)" : "rgba(51,65,85,0.95)";
+            ctx.beginPath();
+            ctx.arc(px(z.x), py(z.y), 28, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = "#f1f5f9";
+            ctx.font = "bold 40px system-ui, sans-serif";
+            ctx.fillText(z.dir > 0 ? "+" : "−", px(z.x), py(z.y) + 2);
+        });
+        rows.forEach(([label, value], row) => {
+            const y = py(row === 0 ? TUNE_H / 4 : -TUNE_H / 4);
+            ctx.fillStyle = "#94a3b8";
+            ctx.font = "bold 24px system-ui, sans-serif";
+            ctx.fillText(label.toUpperCase(), W / 2, y - 22);
+            ctx.fillStyle = "#e2e8f0";
+            ctx.font = "bold 32px system-ui, sans-serif";
+            ctx.fillText(`${Math.round(value * 100)}%`, W / 2, y + 14);
+        });
+        ctx.textAlign = "start"; // restore shared-ctx defaults, same as drawRecenterButton
+        if (this.tuneTexture)
+            this.tuneTexture.needsUpdate = true;
+    }
+    // The record panel's buttons for the current phase, positioned in the panel plane's LOCAL
+    // metres (x right, y up, origin center; the plane is REC_W×REC_H). Rebuilt per frame so the
+    // face tracks the session state; the hit-test and the artwork both read from this one list
+    // so they can't drift. Kept deliberately small — this is a between-driving surface, not a
+    // control the operator hunts through mid-task.
+    recZones() {
+        if (this.recPhase === "recording") {
+            return [{ id: "episode_stop", x: 0, y: -0.005, w: 0.16, h: 0.062, label: "■ Stop episode", tone: "red" }];
+        }
+        if (this.recPhase === "session") {
+            const z = [{ id: "episode_start", x: 0, y: 0.03, w: 0.17, h: 0.055, label: "● Record", tone: "red" }];
+            if (this.recKept > 0) {
+                // A take is bankable, so offer Discard-last beside Finish (keep-by-default in VR; no
+                // in-headset video review — that's a laptop affordance).
+                z.push({ id: "session_end", x: -0.05, y: -0.042, w: 0.085, h: 0.05, label: "Finish", tone: "slate" });
+                z.push({ id: "episode_discard", x: 0.05, y: -0.042, w: 0.085, h: 0.05, label: "Discard", tone: "darkred" });
+            }
+            else {
+                z.push({ id: "session_end", x: 0, y: -0.042, w: 0.13, h: 0.05, label: "Finish session", tone: "slate" });
+            }
+            return z;
+        }
+        return [{ id: "session_start", x: 0, y: -0.005, w: 0.16, h: 0.062, label: "Start session", tone: "blue" }];
+    }
+    // A poke fired on zone `id`: send the record() command AND advance the local phase
+    // optimistically (the panel updates this frame, not a round-trip later). recActedAt gates
+    // reconciliation so a stale reply can't yank the face back. Task label = option C fallback:
+    // a generic "VR session <stamp>" (no keyboard in the headset). Rides episode_start too so a
+    // dropped session_start still lands the label (recorder auto-opens a session on it).
+    fireRecordZone(id) {
+        const t = this.o.teleop;
+        this.recActedAt = performance.now();
+        if (id === "session_start") {
+            this.recTask = `VR session ${this.recStamp()}`;
+            t.record("session_start", this.recTask);
+            this.recPhase = "session";
+            this.recKept = 0;
+            this.o.onLog(`recording: session started — ${this.recTask}`);
+        }
+        else if (id === "episode_start") {
+            if (!this.recTask)
+                this.recTask = `VR session ${this.recStamp()}`;
+            t.record("episode_start", this.recTask);
+            this.recPhase = "recording";
+            this.o.onLog(`recording: episode ${this.recKept + 1} started`);
+        }
+        else if (id === "episode_stop") {
+            t.record("episode_stop"); // keep-by-default: stop finalizes + banks the take on the robot
+            this.recPhase = "session";
+            this.recKept += 1;
+            this.o.onLog(`recording: episode kept (${this.recKept} this session)`);
+        }
+        else if (id === "session_end") {
+            t.record("session_end");
+            this.recPhase = "idle";
+            this.o.onLog("recording: session finished — uploads when the robot next idles");
+        }
+        else if (id === "episode_discard") {
+            t.record("episode_discard");
+            this.recKept = Math.max(0, this.recKept - 1);
+            this.o.onLog("recording: last episode discarded");
+        }
+    }
+    // "2026-07-19 14:38" — a human, sortable session label. new Date() is fine here (this is
+    // browser app code; the Date.now()/new Date() ban is a Workflow-sandbox rule, not a DOM one).
+    recStamp() {
+        const d = new Date();
+        const p = (n) => String(n).padStart(2, "0");
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    }
+    // Anchor + reveal the record panel above the RIGHT controller (stacked above the tune panel),
+    // reconcile the local phase with the robot's recorder, and fire a command when the LEFT tip
+    // pokes a button. Mirrors updateTunePanel, but the hit-test is RECTANGULAR (the buttons are
+    // wide pills, not the tune panel's small ± circles) and worked in the panel's local frame.
+    updateRecordPanel(f, dt) {
+        const btn = this.recBtn;
+        const mat = this.recMat;
+        if (!btn || !mat)
+            return;
+        // Reconcile with the robot's authoritative recorder state, but conservatively: adopt a
+        // MORE-active state (a session opened from the desktop; a take the robot auto-stopped) and
+        // the kept count, but never silently downgrade to "idle" from an absent session_open — the
+        // control channel is unreliable, so a dropped session_start reply must not yank the panel
+        // back to idle under the operator. Finish drives idle locally (via fireRecordZone); a lost
+        // command self-heals because Record sends episode_start, which auto-opens a session. The
+        // grace window ignores replies still reflecting the pre-poke state. (Mirrors how the desktop
+        // DatasetCaptureCard keeps its local phase authoritative.)
+        const rs = this.o.teleop.recordState();
+        if (rs && performance.now() - this.recActedAt > REC_RECONCILE_MS) {
+            if (rs.recording)
+                this.recPhase = "recording";
+            else if (rs.sessionOpen) {
+                if (this.recPhase !== "recording")
+                    this.recPhase = "session";
+            }
+            else if (this.recPhase === "recording")
+                this.recPhase = "session"; // robot ended the take
+            if (typeof rs.episodesKept === "number")
+                this.recKept = rs.episodesKept;
+        }
+        const rp = f.right?.position;
+        const rq = f.right?.orientation;
+        if (!rp) {
+            this.recShown = false; // right hand not tracked: fade out (mirrors the tune panel)
+        }
+        else {
+            const off = new THREE.Vector3(0, REC_UP, 0);
+            const q = rq ? new THREE.Quaternion(rq[0], rq[1], rq[2], rq[3]) : null;
+            if (q)
+                off.applyQuaternion(q);
+            btn.position.set(rp[0] + off.x, rp[1] + off.y, rp[2] + off.z);
+            const head = new THREE.Vector3();
+            this.renderer?.xr.getCamera().getWorldPosition(head);
+            // Same glance test as the tune panel, and hidden while the right clutch is engaged
+            // (driving rolls that wrist straight through the glance pose).
+            if (this.mapper.engagedArms().right) {
+                this.recShown = false;
+            }
+            else if (q) {
+                const up = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+                const toHead = head.clone().sub(btn.position).normalize();
+                const facing = up.dot(toHead);
+                if (!this.recShown && facing > CARD_SHOW_DOT)
+                    this.recShown = true;
+                else if (this.recShown && facing < CARD_HIDE_DOT)
+                    this.recShown = false;
+            }
+            btn.lookAt(head); // billboard, same as the other hand-anchored UI
+        }
+        const target = this.recShown ? 1 : 0;
+        const step = CARD_FADE_PER_S * dt;
+        this.recOpacity =
+            this.recOpacity < target
+                ? Math.min(target, this.recOpacity + step)
+                : Math.max(target, this.recOpacity - step);
+        mat.opacity = this.recOpacity;
+        btn.visible = this.recOpacity > 0.01;
+        // Poke test only while (nearly) fully shown — no blind fires mid-fade. Rectangular
+        // containment in the panel's local plane (worldToLocal divides out UI_SCALE, so the zone
+        // rects read in the same REC_W×REC_H metres recZones() uses).
+        let hot = "";
+        const lp = f.left?.position;
+        if (btn.visible && this.recOpacity > 0.8 && lp) {
+            btn.updateMatrixWorld();
+            const tip = btn.worldToLocal(new THREE.Vector3(lp[0], lp[1], lp[2]));
+            let inZone = "";
+            if (Math.abs(tip.z) < REC_POKE_DEPTH) {
+                for (const z of this.recZones()) {
+                    if (Math.abs(tip.x - z.x) <= z.w / 2 + REC_POKE_MARGIN &&
+                        Math.abs(tip.y - z.y) <= z.h / 2 + REC_POKE_MARGIN) {
+                        inZone = z.id;
+                        break;
+                    }
+                }
+            }
+            hot = inZone;
+            // Fire on enter; must pull the tip REC_REARM_DEPTH off the plane before it can fire
+            // again, so one poke = one command even as the buttons change under it.
+            if (!this.recPoked && inZone) {
+                this.recPoked = true;
+                this.fireRecordZone(inZone);
+            }
+            else if (this.recPoked && Math.abs(tip.z) > REC_REARM_DEPTH) {
+                this.recPoked = false;
+            }
+        }
+        else if (this.recPoked) {
+            this.recPoked = false; // hand left the panel entirely -> re-arm
+        }
+        // Repaint only when the face actually changes (state, count, or highlight).
+        const sig = `${this.recPhase}|${this.recKept}|${hot}`;
+        if (sig !== this.recDrawSig) {
+            this.recHotZone = hot;
+            this.recDrawSig = sig;
+            this.drawRecordPanel();
+        }
+    }
+    // Paint the record panel: a title + status line, then one rounded button per recZones()
+    // entry, tinted by tone (blue=start, red=record/stop, slate=finish, darkred=discard) and
+    // lit green while poked. Button rects derive from recZones() so art + hit-test stay locked.
+    drawRecordPanel() {
+        const ctx = this.recCtx;
+        const cv = this.recCanvas;
+        if (!ctx || !cv)
+            return;
+        const W = cv.width, H = cv.height;
+        const px = (x) => (0.5 + x / REC_W) * W;
+        const py = (y) => (0.5 - y / REC_H) * H;
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(15,23,42,0.92)";
+        this.roundRect(ctx, 4, 4, W - 8, H - 8, 26);
+        ctx.fill();
+        ctx.strokeStyle = "#64748b";
+        ctx.lineWidth = 4;
+        this.roundRect(ctx, 4, 4, W - 8, H - 8, 26);
+        ctx.stroke();
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "bold 24px system-ui, sans-serif";
+        ctx.fillText("RECORD DATASET", W / 2, 34);
+        const status = this.recPhase === "recording" ? `● recording episode ${this.recKept + 1}`
+            : this.recPhase === "session" ? `session open · ${this.recKept} kept`
+                : "no session open";
+        ctx.fillStyle = this.recPhase === "recording" ? "#f87171" : "#cbd5e1";
+        ctx.font = "20px system-ui, sans-serif";
+        ctx.fillText(status, W / 2, 64);
+        const fills = {
+            blue: "rgba(37,99,235,0.92)",
+            red: "rgba(220,38,38,0.92)",
+            darkred: "rgba(153,27,27,0.92)",
+            slate: "rgba(51,65,85,0.95)",
+        };
+        for (const z of this.recZones()) {
+            const cx = px(z.x), cy = py(z.y);
+            const w = (z.w / REC_W) * W, h = (z.h / REC_H) * H;
+            const hot = z.id === this.recHotZone;
+            ctx.fillStyle = hot ? "rgba(34,197,94,0.95)" : (fills[z.tone] ?? fills.slate);
+            this.roundRect(ctx, cx - w / 2, cy - h / 2, w, h, 18);
+            ctx.fill();
+            ctx.strokeStyle = hot ? "#bbf7d0" : "rgba(148,163,184,0.6)";
+            ctx.lineWidth = 3;
+            this.roundRect(ctx, cx - w / 2, cy - h / 2, w, h, 18);
+            ctx.stroke();
+            ctx.fillStyle = "#f1f5f9";
+            ctx.font = `bold ${z.w >= 0.13 ? 30 : 24}px system-ui, sans-serif`;
+            ctx.fillText(z.label, cx, cy + 1);
+        }
+        ctx.textAlign = "start"; // restore shared-ctx default
+        if (this.recTexture)
+            this.recTexture.needsUpdate = true;
+    }
+    // Paint the controls cheat-sheet. Static — called once at session start. Keep the rows in sync
+    // with DEFAULT_BINDINGS above and with the session-start log line.
+    drawControlsCard() {
+        const ctx = this.cardCtx;
+        const cv = this.cardCanvas;
+        if (!ctx || !cv)
+            return;
+        const W = cv.width, H = cv.height;
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(15,23,42,0.92)";
+        this.roundRect(ctx, 4, 4, W - 8, H - 8, 26);
+        ctx.fill();
+        ctx.strokeStyle = "#64748b";
+        ctx.lineWidth = 4;
+        this.roundRect(ctx, 4, 4, W - 8, H - 8, 26);
+        ctx.stroke();
+        ctx.textBaseline = "middle";
+        ctx.textAlign = "start";
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "bold 30px system-ui, sans-serif";
+        ctx.fillText("CONTROLS", 36, 52);
+        const rows = [
+            ["grip", "hold = clutch (move arm)"],
+            ["trigger", "that arm's gripper"],
+            ["B/Y · A/X", "that arm's lift up / down"],
+            ["right stick", "drive the base"],
+            ["left stick ↔", "spin the 3D robot"],
+            ["left stick ↕", "UI closer / further"],
+            ["left press", "E-STOP"],
+            ["right press", "hold = reset"],
+            ["poke ⟳", "recenter the view"],
+        ];
+        // 44 px pitch (was 48) so the ninth row still fits the 512-high canvas.
+        let y = 108;
+        for (const [key, what] of rows) {
+            ctx.fillStyle = "#e2e8f0";
+            ctx.font = "bold 30px system-ui, sans-serif";
+            ctx.fillText(key, 36, y);
+            ctx.fillStyle = "#cbd5e1";
+            ctx.font = "28px system-ui, sans-serif";
+            ctx.fillText(what, 250, y);
+            y += 44;
+        }
+        if (this.cardTexture)
+            this.cardTexture.needsUpdate = true;
     }
     // Paint the Recenter button canvas. `hot` = right controller is near / poking -> highlight.
     drawRecenterButton(hot) {
@@ -511,6 +1326,14 @@ export class VrSession {
         ctx.font = "bold 40px system-ui, sans-serif";
         ctx.fillStyle = FG;
         ctx.fillText("TELEMETRY", pad, y);
+        // A "● REC" flag pinned top-right whenever an episode is capturing, so the operator sees
+        // it's live even with the record panel glanced away (the panel is the control, not the tell).
+        if (this.recPhase === "recording") {
+            ctx.font = "bold 30px system-ui, sans-serif";
+            ctx.fillStyle = RED;
+            const rec = "● REC";
+            ctx.fillText(rec, W - pad - ctx.measureText(rec).width, y);
+        }
         y += 20;
         const t = this.tel;
         const stale = !!t?.active && performance.now() - this.lastTelAt > TEL_STALE_MS;
@@ -537,7 +1360,9 @@ export class VrSession {
             const safetyTone = s === "-" || s === "" ? DIM
                 : ["ok", "normal", "nominal", "clear"].includes(s) ? GREEN : AMBER;
             const tempTone = t.tempC >= 80 ? RED : t.tempC >= 70 ? AMBER : FG;
-            row("control", t.active ? (stale ? "stale" : "active") : "inactive", !t.active ? DIM : stale ? AMBER : GREEN);
+            // Same three-signal rule as the 2D chip (TeleopStatus.tsx) — keep them in lockstep.
+            const controlOk = t.active && !stale && this.motorsOnline;
+            row("control", controlOk ? "connected" : "disconnected", controlOk ? GREEN : RED);
             row("path", t.linkMode ? t.linkMode.toUpperCase() : "—", t.linkMode === "lan" ? GREEN : t.linkMode === "wan" ? AMBER : DIM);
             row("loop", `${t.loopHz.toFixed(1)} Hz`, hzTone);
             row("safety", t.safety, safetyTone);

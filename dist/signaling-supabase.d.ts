@@ -4,9 +4,15 @@ export declare class SupabaseSignaling implements SignalingTransport {
     private supabase;
     private room;
     private log?;
+    private opts;
     private channel;
-    constructor(supabase: SupabaseClient, room: string, log?: ((...args: unknown[]) => void) | undefined);
+    private handlers;
+    private usePrivate;
+    constructor(supabase: SupabaseClient, room: string, log?: ((...args: unknown[]) => void) | undefined, opts?: {
+        private?: boolean;
+    });
     connect(h: SignalingHandlers): Promise<void>;
+    private openChannel;
     sendReady(payload: {
         mac?: string;
     }): void;
