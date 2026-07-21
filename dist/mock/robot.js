@@ -17,7 +17,6 @@
 // local-only), no perception frames (use injectPerception), video is a test pattern.
 import { MockDaemonSim } from "./sim";
 import { createLoopbackSignaling } from "./loopback-signaling";
-import { hmacHex } from "../teleop";
 const TILE_W = 320;
 const TILE_H = 240;
 // The composite is captured at 15 fps (the real robot's power-constrained operating point), so
@@ -301,8 +300,16 @@ export function createMockRobot(opts) {
         },
     };
 }
-// Verify with the operator's own primitive (teleop.ts hmacHex) rather than a second copy of the
-// crypto — the two could otherwise drift and break the token path silently.
+// HMAC-SHA256(token, nonce) as lowercase hex — the room-token proof the mock robot still
+// verifies to exercise the legacy auth path. The operator no longer signs one (room-token auth
+// is retired; the real robot gates access via Supabase RLS), so this lives here on the mock
+// robot side only.
+async function hmacHex(key, msg) {
+    const enc = new TextEncoder();
+    const k = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const sig = await crypto.subtle.sign("HMAC", k, enc.encode(msg));
+    return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
 async function verifyMac(token, nonce, mac) {
     if (!mac)
         return false;

@@ -9,21 +9,40 @@
 //   * the browser is the ANSWERER; a FRESH RTCPeerConnection per offer (robot restarts)
 //   * control rides an UNRELIABLE data channel the robot opens ('control'), bridged on
 //     the Pi to the daemon's NDJSON :7777
-//   * auth: prove possession of the room token via HMAC-SHA256(token, robot-nonce)
+//   * auth: the robot gates private rooms itself (Supabase RLS); the operator no longer
+//     sends a room-token HMAC proof — it simply joins and handshakes
 //   * TURN is additive (STUN-direct preferred); forceRelay validates the relay path
 import { AudioLatencyProbe, audioLatencyEnabled } from "./audioLatency";
 import { VideoQualityLoop } from "./videoQuality";
 import { NORI_PROTOCOL_VERSION } from "./version";
+// ── current units ───────────────────────────────────────────────────────────────────────
+// The daemon sends Present_Current as RAW Feetech LSBs (sign-magnitude, STS3215 addr 69) —
+// telemetry.json documents the field as "Signed raw Present_Current per motor". The STS3215
+// reports 6.5 mA per count.
+//
+// The WIRE deliberately stays in LSBs: every tuning knob the robot is configured with is in
+// the same unit (NORI_STALL_CURRENT, the NORI_STALL_CURRENT_BREAKIN ceiling, config_check's
+// 10..500 range). Converting daemon-side would silently desync telemetry from the numbers an
+// operator sets in lift.env. So convert at the DISPLAY EDGE only, here.
+//
+// Reference points for anyone reading a grip-force bar: the default stall trigger of 90 LSB
+// is ~585 mA, the break-in ceiling of 160 LSB is ~1.04 A, and CURRENT_FULL_LSB (600) is ~3.9 A.
+export const CURRENT_MA_PER_LSB = 6.5;
+// Raw Present_Current LSBs -> milliamps. Sign is preserved; callers that want magnitude
+// should Math.abs() the raw value first (direction is meaningful for haptics, not for force).
+export function currentMa(rawLsb) {
+    return rawLsb * CURRENT_MA_PER_LSB;
+}
+// Raw LSB value mapped to a full grip-force bar, shared by the 2D readout (TeleopStatus) and
+// the VR HUD so the two can't drift apart. This is a DISPLAY normalization, not a limit: it
+// mirrors Torque_Limit's 0..600 span, which is a duty scale rather than a current scale.
+export const CURRENT_FULL_LSB = 600;
 // The states that end an action's lifecycle (awaitAction resolves on these).
 const TERMINAL_ACTION_STATES = new Set(["done", "clamped", "blocked", "timeout"]);
 // How long to sit in "waiting" before calling it a failure. The client keeps re-announcing
 // 'ready' underneath (a robot that boots late still connects on its own) — this deadline only
 // decides when we STOP staying silent and tell the operator something is wrong.
 const WAIT_FOR_ROBOT_MS = 12000;
-// A nack to our first, mac-less 'ready' is an expected pre-handshake artifact (see onNack),
-// so once we HAVE presented a mac we still wait this long before calling it a bad code — a
-// nack racing an in-flight authorized handshake is cancelled the instant the offer arrives.
-const NACK_CONFIRM_MS = 2500;
 // Render a CameraLayout as a one-line description for the LLM vision prompt (e.g. "top-left =
 // left_wrist; …"). Pure + exported so it can be unit-tested without a live peer.
 export function formatCameraLayout(layout) {
@@ -161,19 +180,6 @@ export function keybindLegend(mode) {
 }
 const JOG_HZ_MS = 20; // 50 Hz level-jog
 const BUFFER_LIMIT = 16384; // skip a jog frame if the channel is congested
-// The room-auth proof: HMAC-SHA256 of the robot's nonce under the room token, lowercase hex.
-// Exported so the mock robot (@nori/sdk/mock) verifies with the SAME primitive the operator
-// signs with — two copies of this would have to stay byte-identical (key encoding, hash, hex
-// padding) forever, and any drift would surface as an unexplained "wrong access code".
-export async function hmacHex(key, msg) {
-    if (!crypto.subtle) {
-        throw new Error("crypto.subtle unavailable — open the app over http://localhost or https");
-    }
-    const enc = new TextEncoder();
-    const k = await crypto.subtle.importKey("raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    const sig = await crypto.subtle.sign("HMAC", k, enc.encode(msg));
-    return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
 export class RemoteTeleop {
     constructor(opts) {
         this.pc = null;
@@ -185,8 +191,6 @@ export class RemoteTeleop {
         this.videoLoop = null; // ABR loop (videoQuality.ts, per peer)
         this.jogTimer = null;
         this.controlCh = null;
-        this.curMac = ""; // HMAC of the robot's nonce, proving we hold the token
-        this.nackFailTimer = null; // debounces a nack -> bad_access_code
         this.linkMode = null; // measured ICE path -> daemon watchdog
         // Connect-phase machine (see ConnectStatus). `waitTimer` is the "robot never answered" deadline.
         this.connStatus = { phase: "idle" };
@@ -225,7 +229,7 @@ export class RemoteTeleop {
         // frame — keep last values so the readout doesn't flicker to 0.
         this.tel = {
             loopHz: 0, safety: "-", watchdog: "-", tempC: 0, active: false, linkMode: null, currents: {},
-            state: {}, videoNet: null, batteryPercent: null,
+            state: {}, videoNet: null, batteryPercent: null, motorFaults: {},
         };
         this.stopped = false;
         // Latest world-state from the daemon perception process (Phase F). null until a frame arrives
@@ -818,12 +822,6 @@ export class RemoteTeleop {
             this.waitTimer = null;
         }
     }
-    clearNackTimer() {
-        if (this.nackFailTimer) {
-            clearTimeout(this.nackFailTimer);
-            this.nackFailTimer = null;
-        }
-    }
     // ---- lifecycle -----------------------------------------------------------
     async start() {
         this.stopped = false;
@@ -841,10 +839,8 @@ export class RemoteTeleop {
                 if (!payload || payload.type !== "offer")
                     return;
                 // The robot answered — whatever else goes wrong from here, it is NOT absent, so the
-                // "nobody is home" deadline is void, and any nack we were confirming was the expected
-                // pre-auth transient (we're being offered a session = authorized).
+                // "nobody is home" deadline is void.
                 this.clearWaitDeadline();
-                this.clearNackTimer();
                 this.setPhase("negotiating");
                 try {
                     this.log("offer received; building fresh peer + answering...");
@@ -908,23 +904,16 @@ export class RemoteTeleop {
                     this.pendingIce.push(cand);
                 }
             },
-            // robot (re)joined -> it carries the auth nonce; prove we hold the token (HMAC),
-            // then ask for a fresh offer. (No token configured on either side = open room.)
-            onRobotHere: async (payload) => {
+            // robot (re)joined the room -> re-announce 'ready' so it (re)offers. The room token is
+            // retired: the robot gates private-room access itself (Supabase RLS), so there's no HMAC
+            // proof to compute here anymore — we just handshake.
+            onRobotHere: async () => {
                 this.connected = false;
-                try {
-                    this.curMac =
-                        this.o.token && payload && payload.nonce ? await hmacHex(this.o.token, payload.nonce) : "";
-                }
-                catch (e) {
-                    this.log("auth error:", e.message);
-                    this.curMac = "";
-                }
-                this.log("robot announced — sending 'ready'" + (this.curMac ? " (authenticated)" : ""));
+                this.log("robot announced — sending 'ready'");
                 this.sendReady();
             },
-            // The robot refused our access code. Report it immediately — no point waiting out the
-            // deadline, the answer won't change. Advisory (a nack is forgeable by anyone in the room),
+            // The robot refused our 'ready'. Report a concrete refusal immediately — no point waiting out
+            // the deadline, the answer won't change. Advisory (a nack is forgeable by anyone in the room),
             // so it only picks the error copy; it never grants or denies anything.
             onNack: (payload) => {
                 if (this.connected)
@@ -935,29 +924,11 @@ export class RemoteTeleop {
                     this.setPhase("failed", "session_rejected", payload.reason);
                     return;
                 }
-                // A nack to our FIRST 'ready' is expected, not a bad code. Supabase broadcasts aren't
-                // retained, so we join without the robot's nonce and our first 'ready' goes out mac-less
-                // (curMac === ""); the robot re-announces its nonce, onRobotHere recomputes the mac, and
-                // the retry connects. Treating that transient nack as a failure is what flashed "wrong
-                // access code" on every normal connect. So: never fail on a nack before we've actually
-                // PRESENTED a mac, and even after that, debounce — a nack racing an in-flight authorized
-                // handshake (the offer is seconds behind) is cancelled the moment the offer arrives
-                // (onSdp) or we connect. A genuinely wrong code keeps nacking every 2 s retry, so the
-                // timer still fires.
-                if (!this.curMac) {
-                    this.log("ignoring pre-handshake nack (no access code presented yet)");
-                    return;
-                }
-                if (this.nackFailTimer)
-                    return; // already confirming; don't reset (let a real bad code fire)
-                this.log("robot refused the access code — confirming…");
-                this.nackFailTimer = setTimeout(() => {
-                    this.nackFailTimer = null;
-                    if (this.connected)
-                        return;
-                    this.clearWaitDeadline();
-                    this.setPhase("failed", "bad_access_code");
-                }, NACK_CONFIRM_MS);
+                // Room-token auth is retired (the robot gates access via Supabase RLS), so an
+                // "unauthorized"/reasonless nack is now a stray or forged artifact rather than a wrong
+                // access code. Ignore it and keep retrying 'ready' — an authorized operator that's in the
+                // room will get an offer regardless.
+                this.log("ignoring unauthorized nack (room-token auth retired — the robot gates access itself)");
             },
             onOpen: () => {
                 this.connected = false;
@@ -1016,7 +987,6 @@ export class RemoteTeleop {
             this.jogTimer = null;
         }
         this.clearWaitDeadline();
-        this.clearNackTimer();
         this.latencyProbe?.stop();
         this.videoLoop?.stop();
         this.tel.videoNet = null;
@@ -1045,7 +1015,7 @@ export class RemoteTeleop {
         return this.latencyProbe ? this.latencyProbe.logOnce() : null;
     }
     sendReady() {
-        this.o.signaling.sendReady(this.curMac ? { mac: this.curMac } : {});
+        this.o.signaling.sendReady({});
     }
     freshPeer() {
         if (this.pc) {
@@ -1114,7 +1084,6 @@ export class RemoteTeleop {
             if (pc.connectionState === "connected") {
                 this.connected = true;
                 this.clearWaitDeadline();
-                this.clearNackTimer();
                 this.setPhase("connected");
                 if (this.retryTimer) {
                     clearInterval(this.retryTimer);
@@ -1248,6 +1217,12 @@ export class RemoteTeleop {
                     this.tel.safety = status.safety;
                 if (status.watchdog)
                     this.tel.watchdog = status.watchdog;
+                // Per-motor hardware faults. The daemon sends the FULL current fault set in each status
+                // block (and omits the field entirely when nothing is faulted), so replace wholesale —
+                // a recovered motor drops out. Only touched when a status block is present (5 Hz), so a
+                // per-tick telemetry frame without `status` leaves the last set intact.
+                this.tel.motorFaults =
+                    status.motor_faults && typeof status.motor_faults === "object" ? status.motor_faults : {};
             }
             // Per-motor Present_Current (virtual tactile signal) -> VR haptics + on-screen readout.
             if (m.currents && typeof m.currents === "object") {

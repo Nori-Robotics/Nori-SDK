@@ -12,6 +12,9 @@ export interface ExternalJog {
 export type LeaderActionDeg = Record<string, number>;
 export type SafetyState = "ok" | "safe_hold" | "latched" | (string & {});
 export type WatchdogState = "ok" | "warn" | "stop" | (string & {});
+export declare const CURRENT_MA_PER_LSB = 6.5;
+export declare function currentMa(rawLsb: number): number;
+export declare const CURRENT_FULL_LSB = 600;
 export interface TelemetryView {
     loopHz: number;
     safety: SafetyState;
@@ -23,6 +26,7 @@ export interface TelemetryView {
     state: Record<string, number>;
     videoNet: VideoNetState | null;
     batteryPercent: number | null;
+    motorFaults: Record<string, string>;
 }
 export interface PerceivedObject {
     label: string;
@@ -118,7 +122,6 @@ export interface RemoteTeleopOptions {
     signaling: SignalingTransport;
     videoEl?: HTMLVideoElement;
     audioEl?: HTMLAudioElement;
-    token: string;
     stun: string;
     turnUrls: string[];
     turnUser: string;
@@ -168,7 +171,6 @@ export declare function keybindLegend(mode: ControlMode): {
         label: string;
     }[];
 };
-export declare function hmacHex(key: string, msg: string): Promise<string>;
 export declare class RemoteTeleop {
     private o;
     private pc;
@@ -180,8 +182,6 @@ export declare class RemoteTeleop {
     private videoLoop;
     private jogTimer;
     private controlCh;
-    private curMac;
-    private nackFailTimer;
     private linkMode;
     private connStatus;
     private waitTimer;
@@ -266,7 +266,6 @@ export declare class RemoteTeleop {
     connectStatus(): ConnectStatus;
     private armWaitDeadline;
     private clearWaitDeadline;
-    private clearNackTimer;
     start(): Promise<void>;
     stop(): Promise<void>;
     logAudioLatency(): Promise<import("./audioLatency").AudioLatencySample | null>;
