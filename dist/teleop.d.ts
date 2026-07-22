@@ -54,7 +54,7 @@ export interface DaemonStatus {
     detail?: string;
 }
 export type ConnectPhase = "idle" | "joining" | "waiting" | "negotiating" | "connected" | "failed";
-export type ConnectFailure = "signaling_unreachable" | "bad_access_code" | "robot_not_responding" | "ice_failed" | "negotiation_failed" | "session_rejected";
+export type ConnectFailure = "signaling_unreachable" | "robot_not_responding" | "ice_failed" | "negotiation_failed" | "session_rejected";
 export interface ConnectStatus {
     phase: ConnectPhase;
     reason?: ConnectFailure;
