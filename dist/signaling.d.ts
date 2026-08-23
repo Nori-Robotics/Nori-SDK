@@ -21,10 +21,17 @@ export interface SignalingHandlers {
     onOpen: () => void;
     onState?: (state: SignalingState) => void;
 }
+export interface ReadyTurn {
+    urls: string[];
+    username: string;
+    credential: string;
+}
 export interface SignalingTransport {
     connect(handlers: SignalingHandlers): Promise<void>;
     sendReady(payload: {
         mac?: string;
+        turn?: ReadyTurn;
+        grant?: string;
     }): void;
     sendSdp(payload: SdpPayload): void;
     sendIce(payload: IcePayload): void;

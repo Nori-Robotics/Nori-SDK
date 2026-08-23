@@ -24,6 +24,7 @@ export interface VrSessionOptions {
     bindings?: VrBindings;
     tuning?: VrTuning;
     onTuningChange?: (t: Required<VrTuning>) => void;
+    onActivity?: () => void;
 }
 export declare class VrSession {
     private o;
@@ -51,6 +52,11 @@ export declare class VrSession {
     private lastHudDraw;
     private resetHeldSince;
     private resetFired;
+    private prevLeftPos;
+    private prevRightPos;
+    private lastActivityAt;
+    private idlePromptOpen;
+    private idleSecondsLeft;
     private recenterPending;
     private rcBtn;
     private rcBtnCanvas;
@@ -96,6 +102,7 @@ export declare class VrSession {
     setCurrents(c: Record<string, number>): void;
     setTelemetry(t: TelemetryView): void;
     setMotorsOnline(ok: boolean): void;
+    setIdlePrompt(open: boolean, secondsLeft: number): void;
     reclutch(): void;
     start(): Promise<void>;
     stop(): Promise<void>;
@@ -103,6 +110,8 @@ export declare class VrSession {
     private onXRFrame;
     private buttonDown;
     private sampleController;
+    private detectActivity;
+    private movedSince;
     recenter(): void;
     private serviceRecenter;
     private updateRecenterButton;
@@ -119,6 +128,7 @@ export declare class VrSession {
     private drawRecenterButton;
     private handleResetHold;
     private drawHud;
+    private drawIdleBanner;
     private roundRect;
     private shortMotor;
     private applyHaptics;

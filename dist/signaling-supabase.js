@@ -42,7 +42,7 @@ export class SupabaseSignaling {
             return;
         if (this.channel) {
             try {
-                await this.channel.unsubscribe();
+                await this.supabase.removeChannel(this.channel);
             }
             catch { /* noop */ }
         }
@@ -97,8 +97,14 @@ export class SupabaseSignaling {
     }
     async close() {
         if (this.channel) {
+            // Use removeChannel, NOT bare channel.unsubscribe(): unsubscribe() tears down the
+            // subscription but LEAVES the channel in the shared client's registry (getChannels()),
+            // keyed by topic (= room). The Supabase client is a singleton reused across every
+            // connect/disconnect, so on reconnect supabase.channel(room) collides with this dead
+            // sibling and never reaches SUBSCRIBED — which is why a hard reload (fresh client, empty
+            // registry) was the only way to reconnect. removeChannel unsubscribes AND drops it.
             try {
-                await this.channel.unsubscribe();
+                await this.supabase.removeChannel(this.channel);
             }
             catch { /* noop */ }
             this.channel = null;

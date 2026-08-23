@@ -15,6 +15,7 @@
 import { AudioLatencyProbe, audioLatencyEnabled } from "./audioLatency";
 import { VideoQualityLoop } from "./videoQuality";
 import { NORI_PROTOCOL_VERSION } from "./version";
+import { liftJogKey } from "./rail";
 // ── current units ───────────────────────────────────────────────────────────────────────
 // The daemon sends Present_Current as RAW Feetech LSBs (sign-magnitude, STS3215 addr 69) —
 // telemetry.json documents the field as "Signed raw Present_Current per motor". The STS3215
@@ -77,6 +78,15 @@ export function cameraTileRect(layout, role, vw, vh) {
     const sh = vh / layout.rows;
     return { sx: (idx % layout.cols) * sw, sy: Math.floor(idx / layout.cols) * sh, sw, sh };
 }
+// Three-valued capability check (mirrors nori-sdk-py RobotInfo.supports): true/false when
+// the robot declared its capabilities, undefined when the ack predates the field — callers
+// must treat undefined as "unknown, probe or assume legacy", never as false.
+export function supportsCapability(info, capability) {
+    const caps = info?.capabilities;
+    if (caps === undefined)
+        return undefined;
+    return caps.includes(capability);
+}
 // Coerce a wire `ack` frame into a RobotInfo. Tolerant of old daemons that send a bare
 // {type:"ack"} (absent `accepted` counts as accepted; everything else optional). Pure +
 // exported so the handshake parse is unit-testable without a live peer.
@@ -98,6 +108,10 @@ export function parseAck(m, sdkProtocolVersion = NORI_PROTOCOL_VERSION) {
             : undefined,
         error: typeof m.error === "string" ? m.error : undefined,
         versionMismatch: protocolVersion !== undefined && protocolVersion !== sdkProtocolVersion,
+        model: typeof m.model === "string" && m.model ? m.model : undefined,
+        capabilities: Array.isArray(m.capabilities) && m.capabilities.every((c) => typeof c === "string")
+            ? m.capabilities
+            : undefined,
     };
 }
 // Two schemes; 'm' toggles. Default = CYLINDRICAL (the rpi4 feel).
@@ -119,6 +133,63 @@ export const JOINT_KEYS = {
     t: ["wrist_roll", 1], g: ["wrist_roll", -1],
     y: ["gripper", 1], h: ["gripper", -1],
 };
+// ---- L3: descriptor-driven per-motor jog (additive; L2 byte-identical) ----
+// L2 daemons advertise (or predate) the classic 6-DOF vocabulary in
+// JOINT_KEYS; the L3 gateway's ack descriptor advertises its real arm joints
+// ("right_arm_shoulder_pitch.pos", ...). Only when a descriptor names arm
+// joints OUTSIDE the L2 set does per-motor mode derive its keymap from the
+// descriptor. No descriptor, or the L2 vocabulary, keeps the exact legacy
+// map — every deployed L2 behaves identically.
+const L2_JOINT_SHORTS = new Set([
+    "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper",
+]);
+// Anatomical display/keyboard order for known L3 joints; unknown joints sort last.
+const L3_PREFERRED_ORDER = [
+    "shoulder_pitch", "shoulder_roll", "bicep_yaw", "elbow_pitch",
+    "forearm_yaw", "wrist_pitch", "wrist_roll",
+];
+// Key pairs for dynamically-mapped joints, row order. Deliberately avoids
+// i/k/j/l (base), u/o (lift), m (mode toggle) and space/p/c (commands).
+const DYNAMIC_KEY_PAIRS = [
+    ["q", "a"], ["w", "s"], ["e", "d"], ["r", "f"],
+    ["t", "g"], ["y", "h"], ["z", "x"], ["b", "n"],
+];
+// The descriptor's arm-joint short names for one arm, or null when the robot
+// speaks the L2 vocabulary (=> use the legacy JOINT_KEYS untouched).
+export function l3JointShorts(descriptor, arm) {
+    const joints = descriptor?.joints;
+    if (!joints)
+        return null;
+    const prefix = `${arm}_arm_`;
+    const shorts = [];
+    for (const key of joints) {
+        if (!key.startsWith(prefix) || !key.endsWith(".pos"))
+            continue;
+        const short = key.slice(prefix.length, -".pos".length);
+        if (short !== "gripper")
+            shorts.push(short);
+    }
+    if (!shorts.length || shorts.every((s) => L2_JOINT_SHORTS.has(s)))
+        return null;
+    const rank = (s) => {
+        const i = L3_PREFERRED_ORDER.indexOf(s);
+        return i < 0 ? L3_PREFERRED_ORDER.length : i;
+    };
+    shorts.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+    return shorts;
+}
+// Build a per-motor keymap for descriptor-advertised joints. The gripper
+// always keeps the last pair, so it can never fall off the keyboard.
+export function jointKeymapForShorts(shorts) {
+    const dofs = [...shorts.slice(0, DYNAMIC_KEY_PAIRS.length - 1), "gripper"];
+    const map = {};
+    dofs.forEach((short, i) => {
+        const [pos, neg] = DYNAMIC_KEY_PAIRS[i];
+        map[pos] = [short, 1];
+        map[neg] = [short, -1];
+    });
+    return map;
+}
 export const BASE_KEYS = {
     i: ["linear", 1], k: ["linear", -1], j: ["angular", 1], l: ["angular", -1],
     // WASD alias for the same base DOFs. jogTick gives the ARM keymap first claim on a
@@ -164,10 +235,12 @@ export function baseKeyClusters() {
 }
 // Structured control legend for a given mode — derived from the exported maps above so it
 // can never drift from what the keys actually send.
-export function keybindLegend(mode) {
+export function keybindLegend(mode, jointShorts) {
     const [u, o] = Object.entries(ZLIFT_KEYS).sort((a, b) => b[1] - a[1]).map(([k]) => k);
     return {
-        arm: rowsFromAxisMap(mode === "joint" ? JOINT_KEYS : TASK_KEYS),
+        arm: rowsFromAxisMap(mode === "joint"
+            ? (jointShorts ? jointKeymapForShorts(jointShorts) : JOINT_KEYS)
+            : TASK_KEYS),
         base: rowsFromAxisMap(BASE_KEYS),
         lift: { dof: "lift (selected arm)", posKey: u, negKey: o },
         commands: [
@@ -229,7 +302,7 @@ export class RemoteTeleop {
         // frame — keep last values so the readout doesn't flicker to 0.
         this.tel = {
             loopHz: 0, safety: "-", watchdog: "-", tempC: 0, active: false, linkMode: null, currents: {},
-            state: {}, videoNet: null, batteryPercent: null, motorFaults: {},
+            state: {}, videoNet: null, batteryPercent: null, motorFaults: {}, servoTemps: {}, latchReason: null,
         };
         this.stopped = false;
         // Latest world-state from the daemon perception process (Phase F). null until a frame arrives
@@ -248,6 +321,8 @@ export class RemoteTeleop {
         this.cameraLayoutRaw = null;
         this.daemonStat = null; // latest daemon_status (bridge health frame)
         this.recStat = null; // latest record_status (W2.11 recorder reply)
+        this.psStat = null; // latest policy_stream_status
+        this.psWaiters = []; // FIFO, one per in-flight policyStream()
         // The parsed handshake ack (P4.1). null until the daemon's ack arrives; refreshed on every
         // daemon (re)connect (a fresh offer means a fresh session, and the daemon re-acks).
         this.ackInfo = null;
@@ -266,6 +341,11 @@ export class RemoteTeleop {
             robotAudio: false, robotMicLive: false, robotMicMuted: false, cameraOn: false,
         };
         this.log = (...a) => this.o.onLog(a.join(" "));
+        // NOTE: the handshake lives in `ackInfo` (declared above) and is read through the public
+        // robotInfo() accessor. There used to be a SECOND private field named `robotInfo` here
+        // holding the same value — which shadowed that method on every instance, so
+        // `teleop.robotInfo()` threw "is not a function" for the whole life of the session.
+        this.dynamicKeymap = null;
         this.o = opts;
         if (opts.mode)
             this.mode = opts.mode;
@@ -417,6 +497,87 @@ export class RemoteTeleop {
     nextActionId() {
         return `a${++this.actionSeq}`;
     }
+    // Send an absolute Cartesian pose target for ONE arm's gripper TCP (nori-protocol
+    // control.pose; capability "pose_targets"). The robot solves IK ON-BOARD — the wire never
+    // carries joint solutions — then latches and tracks the result exactly like sendAction:
+    // a zero jog does not cancel it, the watchdog's t_stop drops it. Lifecycle rides the
+    // action_id through action_status (awaitAction resolves on the terminal state; the
+    // intermediate "active" means solved-and-tracking). Failure is a modelled `blocked`
+    // reason, not an exception: "no_ik_solution" (full pose: not retriable at this lift
+    // height; position-only: wrist-dependent, retry with an orientation), "ik_timeout"
+    // (retry), "limit:<joint>", "singularity", "collision", "lift_moved" (re-send to
+    // re-solve), "config_jump" (split the move into waypoints), "frame:<name>".
+    //
+    // Conventions (NORMATIVE, nori-protocol control.json): metres in base_footprint, REP-103
+    // (+x forward, +y left, +z up), quaternion [x, y, z, w]. OMIT the orientation for "get
+    // the gripper to this point, any wrist angle" — the robot solves at its current wrist.
+    //
+    // THROWS if the robot's ack EXPLICITLY lacks "pose_targets" (the frame would be silently
+    // ignored — a hung move with no error is worse than a throw). An ack that predates
+    // capabilities entirely passes through: probe-or-assume-legacy is the ack contract.
+    // Malformed vectors also throw here rather than costing a round trip to a "bad_pose".
+    sendPose(side, positionM, orientationXyzw, actionId) {
+        if (supportsCapability(this.ackInfo, "pose_targets") === false) {
+            throw new Error("this robot does not advertise the pose_targets capability — a pose frame would " +
+                "be silently ignored");
+        }
+        if (side !== "left" && side !== "right") {
+            throw new Error(`sendPose: side must be "left" or "right", got ${String(side)}`);
+        }
+        if (positionM.length !== 3) {
+            throw new Error(`sendPose: positionM needs [x, y, z] metres, got ${positionM.length}`);
+        }
+        if (orientationXyzw !== undefined && orientationXyzw.length !== 4) {
+            throw new Error(`sendPose: orientationXyzw needs [x, y, z, w], got ${orientationXyzw.length}`);
+        }
+        const target = {
+            frame: "base_footprint",
+            position_m: [...positionM],
+        };
+        if (orientationXyzw !== undefined)
+            target.orientation_xyzw = [...orientationXyzw];
+        const frame = {
+            type: "control", seq: this.seq++, pose: { [`${side}_arm`]: target },
+        };
+        if (actionId)
+            frame.action_id = actionId;
+        this.dcSend(frame);
+    }
+    // Drive the robot's policy streamer (STREAM_INTEGRATION_PLAN §3): the observation
+    // leg of remote inference. `start` makes the ROBOT dial out to `target` (the
+    // lelab receiver from /nori/rollout/stream/open) and push full-quality frames.
+    // Resolves with the robot's reply, or a synthetic timeout error after `timeoutMs`
+    // — never rejects (the awaitAction contract). Default 12 s because the robot-side
+    // relay legitimately blocks up to ~8 s on `start` (sink connect + preamble); a
+    // shorter wait reports "timeout" while the stream then actually starts.
+    policyStream(action, opts) {
+        const frame = { type: "policy_stream", action };
+        if (opts?.dest)
+            frame.dest = opts.dest;
+        if (opts?.target)
+            frame.target = opts.target;
+        // Pentest V10 sink auth: the robot must echo this token in its stream preamble.
+        // Travels over the authenticated datachannel, so an off-channel attacker never sees it.
+        if (opts?.token)
+            frame.token = opts.token;
+        return new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                const i = this.psWaiters.indexOf(entry);
+                if (i >= 0)
+                    this.psWaiters.splice(i, 1);
+                resolve({ ok: false, streaming: false, dest: null,
+                    error: `policy_stream ${action}: no reply in ${opts?.timeoutMs ?? 12000}ms` });
+            }, opts?.timeoutMs ?? 12000);
+            const entry = (s) => { clearTimeout(timer); resolve(s); };
+            this.psWaiters.push(entry);
+            this.dcSend(frame);
+        });
+    }
+    // Latest policy_stream_status seen (any), or null. The mid-run death statuses
+    // ("sink timeout", "camera silence") land here even with no command in flight.
+    policyStreamStatus() {
+        return this.psStat;
+    }
     // Hand the arms to an autonomous policy (or take them back). While on, the 50 Hz
     // jog tick drops the leader's absolute targets and held keys so only sendAction()
     // drives the arms — otherwise the ever-present jog frame out-votes the policy and
@@ -477,13 +638,16 @@ export class RemoteTeleop {
     // Legacy one-episode aliases (kept for the bench page / auto mode): start {task}
     // = session_start+episode_start; stop = episode_stop+session_end; discard /
     // discard_last = session_discard.
-    record(action, task) {
+    record(action, task, opts) {
         const msg = { type: "record", action };
         // Task rides episode_start too: if session_start dropped on the unreliable
         // control channel, the robot auto-opens a session on episode_start and needs
         // the task from here so it isn't lost.
-        if ((action === "start" || action === "session_start" || action === "episode_start") && task) {
-            msg.task = task;
+        if (action === "start" || action === "session_start" || action === "episode_start") {
+            if (task)
+                msg.task = task;
+            if (opts?.stereo)
+                msg.stereo = true;
         }
         this.dcSend(msg);
     }
@@ -1015,7 +1179,26 @@ export class RemoteTeleop {
         return this.latencyProbe ? this.latencyProbe.logOnce() : null;
     }
     sendReady() {
-        this.o.signaling.sendReady({});
+        // Forward this session's TURN creds so the ROBOT can gather relay candidates
+        // too. Without them a host-only robot is unreachable through a relay (the
+        // relay can't route to LAN/tailnet addrs, and coturn drops the robot's
+        // inbound checks — its public addr was never signaled, so no permission
+        // exists). Creds are short-lived and backend-minted; see ReadyTurn.
+        const turn = this.o.turnUrls.length
+            ? { urls: this.o.turnUrls, username: this.o.turnUser, credential: this.o.turnCred }
+            : undefined;
+        // Pentest V1: carry the DTLS-fingerprint-bound session grant so the robot can authorize
+        // motion independently of Supabase RLS. Inert until the gateway's require_session_grant
+        // flag flips; a warm-mode gateway ignores an unknown sibling.
+        // NOTE (open, coordinate with the gateway half): the gateway DEDUPES `ready`
+        // (_start_session returns if a session already exists), so re-sending `ready` won't
+        // deliver a REFRESHED grant for the in-session re-verify (V8). The initial-handshake
+        // grant below is correct; the ~90s refresh transport (re-sent ready vs a datachannel
+        // control frame) is pending the gateway's re-verify mechanism — not built here yet.
+        this.o.signaling.sendReady({
+            ...(turn ? { turn } : {}),
+            ...(this.o.sessionGrant ? { grant: this.o.sessionGrant } : {}),
+        });
     }
     freshPeer() {
         if (this.pc) {
@@ -1029,6 +1212,10 @@ export class RemoteTeleop {
         const pc = new RTCPeerConnection({
             iceServers: this.iceServers(),
             iceTransportPolicy: this.o.forceRelay ? "relay" : "all",
+            // Pentest V1: pin the DTLS identity to the pre-generated cert the session grant is bound
+            // to (getFingerprints() of this cert == the grant's dtls_fp). Omitted => auto-generated
+            // cert (anonymous/legacy path). Must be set at construction; a cert can't be swapped in.
+            ...(this.o.cert ? { certificates: [this.o.cert] } : {}),
         });
         this.pc = pc;
         this.latencyProbe?.stop();
@@ -1215,6 +1402,8 @@ export class RemoteTeleop {
             if (status) {
                 if (status.safety)
                     this.tel.safety = status.safety;
+                // null/absent -> not latched; replace wholesale so a cleared latch drops the banner.
+                this.tel.latchReason = typeof status.latch_reason === "string" ? status.latch_reason : null;
                 if (status.watchdog)
                     this.tel.watchdog = status.watchdog;
                 // Per-motor hardware faults. The daemon sends the FULL current fault set in each status
@@ -1224,6 +1413,11 @@ export class RemoteTeleop {
                 this.tel.motorFaults =
                     status.motor_faults && typeof status.motor_faults === "object" ? status.motor_faults : {};
             }
+            // Per-motor servo case temps (1 Hz sweep). Only present on periodic blocks from
+            // new daemons; replace wholesale when present so a recovered read updates cleanly,
+            // and keep the last sweep otherwise (same no-flicker rule as loop_hz/status).
+            if (m.servo_temps && typeof m.servo_temps === "object")
+                this.tel.servoTemps = m.servo_temps;
             // Per-motor Present_Current (virtual tactile signal) -> VR haptics + on-screen readout.
             if (m.currents && typeof m.currents === "object") {
                 this.tel.currents = m.currents;
@@ -1270,6 +1464,9 @@ export class RemoteTeleop {
         }
         else if (m.type === "record_status") {
             this.ingestRecordStatus(m);
+        }
+        else if (m.type === "policy_stream_status") {
+            this.ingestPolicyStream(m);
         }
         else if (m.type === "ack") {
             this.ingestAck(m);
@@ -1348,7 +1545,11 @@ export class RemoteTeleop {
                 `v${NORI_PROTOCOL_VERSION}. Proceeding (unknown frames are ignored by both sides); ` +
                 `expect vocabulary gaps, not unsafe behavior.`);
         }
+        this.dynamicKeymap = null; // rebuild the per-motor map from this ack
         const d = info.descriptor;
+        const l3 = l3JointShorts(d, this.o.arm);
+        if (l3)
+            this.log(`descriptor-driven per-motor jog: ${l3.length} arm joints`);
         this.log("robot ack: accepted=" + info.accepted +
             (info.protocolVersion !== undefined ? ` protocol=v${info.protocolVersion}` : "") +
             (info.normMode ? ` norm=${info.normMode}` : "") +
@@ -1407,6 +1608,31 @@ export class RemoteTeleop {
     daemonStatus() {
         return this.daemonStat;
     }
+    // Coerce a policy_stream_status reply (fields per rpi5/media/policy_streamer.py
+    // _status), cache it, resolve the oldest in-flight policyStream() call, notify.
+    // FIFO waiter resolution: replies arrive in command order over the ordered data
+    // channel, so the oldest waiter owns the next reply.
+    ingestPolicyStream(m) {
+        const s = {
+            ok: m.ok === true,
+            streaming: m.streaming === true,
+            dest: typeof m.dest === "string" ? m.dest : null,
+        };
+        if (typeof m.fps_out === "number")
+            s.fpsOut = m.fps_out;
+        if (typeof m.frames_sent === "number")
+            s.framesSent = m.frames_sent;
+        if (typeof m.dropped === "number")
+            s.dropped = m.dropped;
+        if (typeof m.error === "string" && m.error)
+            s.error = m.error;
+        this.psStat = s;
+        this.log(s.error ? `policy stream: ${s.error}`
+            : s.streaming ? `policy stream live -> ${s.dest} (${s.fpsOut ?? "?"} fps, ${s.dropped ?? 0} dropped)`
+                : "policy stream idle");
+        this.psWaiters.shift()?.(s);
+        this.o.onPolicyStream?.(s);
+    }
     // W2.11: coerce a record_status reply (fields per rpi5/media/recorder.py _status),
     // cache it, notify. Replies are direct answers to record() commands — no dedupe
     // (a repeated "status" probe legitimately returns the same state, and free_gb drifts).
@@ -1423,6 +1649,8 @@ export class RemoteTeleop {
             s.episode = m.episode;
         if (typeof m.free_gb === "number")
             s.freeGb = m.free_gb;
+        if (m.stereo === true)
+            s.stereo = true;
         if (typeof m.error === "string" && m.error)
             s.error = m.error;
         this.recStat = s;
@@ -1485,8 +1713,21 @@ export class RemoteTeleop {
             }
         }
     }
+    // Descriptor shorts for the CURRENTLY selected arm, or null on L2 robots.
+    // Public so the page can render the matching legend.
+    armJointShorts() {
+        return l3JointShorts(this.ackInfo?.descriptor, this.o.arm);
+    }
     armKeymap() {
-        return this.mode === "joint" ? JOINT_KEYS : TASK_KEYS;
+        if (this.mode !== "joint")
+            return TASK_KEYS;
+        const cached = this.dynamicKeymap;
+        if (cached && cached.arm === this.o.arm)
+            return cached.map;
+        const shorts = this.armJointShorts();
+        const map = shorts ? jointKeymapForShorts(shorts) : JOINT_KEYS;
+        this.dynamicKeymap = { arm: this.o.arm, map };
+        return map;
     }
     setMode(m) {
         this.mode = m;
@@ -1559,8 +1800,10 @@ export class RemoteTeleop {
         const km = this.armKeymap();
         // joint mode: always send all 6 joint fields (0 default) so the daemon picks the
         // per-motor path. cylindrical mode: send only task DOFs -> daemon task/IK path.
+        // Derived from the ACTIVE keymap, so it is the L2 literal for JOINT_KEYS
+        // and the descriptor's joints for an L3 map — never a stale vocabulary.
         const a = this.mode === "joint"
-            ? { shoulder_pan: 0, shoulder_lift: 0, elbow_flex: 0, wrist_flex: 0, wrist_roll: 0, gripper: 0 }
+            ? Object.fromEntries(Object.values(km).map(([dof]) => [dof, 0]))
             : {};
         const base = {};
         let z = 0;
@@ -1577,11 +1820,12 @@ export class RemoteTeleop {
                 const [d, s] = km[k];
                 a[d] = s * sp;
             }
-            // Firmware turns the base opposite our "+angular = left" convention, so negate the
-            // angular sign on the wire (keeps BASE_KEYS/legend reading a,j = left, and now true).
+            // Firmware drives the base opposite our sign convention on BOTH axes (+linear =
+            // forward, +angular = left), so negate on the wire — keeps BASE_KEYS/legend reading
+            // naturally (i/w = forward, a/j = left) while sending what the firmware actually wants.
             else if (k in BASE_KEYS) {
                 const [dof, s] = BASE_KEYS[k];
-                base[dof] = (dof === "angular" ? -s : s) * sp;
+                base[dof] = -s * sp;
             }
             else if (k in ZLIFT_KEYS)
                 z = ZLIFT_KEYS[k] * sp;
@@ -1593,9 +1837,16 @@ export class RemoteTeleop {
         const jog = leader ? { base } : { [`${this.o.arm}_arm`]: a };
         if (!leader && Object.keys(base).length)
             jog.base = base;
-        // u/o lift the CURRENTLY SELECTED arm (the dropdown that scopes the arm keys).
-        if (z)
-            jog[`${this.o.arm}_lift`] = z;
+        // u/o lift the CURRENTLY SELECTED arm (the dropdown that scopes the arm keys) on a robot
+        // with per-arm rails; on an A-series robot there is ONE central column and both arm
+        // selections drive it. Resolved from the descriptor rather than composed as
+        // `${arm}_lift`, which named a key an A3 does not have — the robot ignored it in silence,
+        // so the operator's lift keys did nothing at all and reported nothing.
+        if (z) {
+            const lk = liftJogKey(this.ackInfo?.descriptor, this.o.arm);
+            if (lk)
+                jog[lk] = z;
+        }
         const frame = { type: "control", seq: this.seq++, jog };
         if (leader)
             frame.leader_action_deg = leader;

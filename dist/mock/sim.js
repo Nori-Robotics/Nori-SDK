@@ -62,6 +62,12 @@ export class MockDaemonSim {
         this.recEpisode = null; // open episode id, or null
         this.recKept = 0; // episodes kept in the open session
         this.recSeq = 0;
+        // Stereo-view enforcement (session-scoped): taken from `stereo: true` on
+        // session_start (or on the episode_start that auto-opens a session after a
+        // dropped session_start — same recovery as `task`), echoed in every
+        // record_status while the session is open, cleared when it closes. A real
+        // robot enforces one matched frame rate on the front + overhead cameras.
+        this.recStereo = false;
         this.descriptor = opts?.descriptor ?? defaultDescriptor();
         this.watchdog = opts?.watchdog ?? { t_warn_ms: 300, t_stop_ms: 1000 };
         this.protocolVersion = opts?.protocolVersion ?? 1;
@@ -85,6 +91,14 @@ export class MockDaemonSim {
             type: "ack",
             accepted: true,
             protocol_version: this.protocolVersion,
+            // Advisory label so logs name the double honestly (never branch on it).
+            model: "SIM",
+            // The TRUTHFUL set of optional verbs this double honours — the spec's rule for a
+            // merged stack. Deliberately NOT "pose_targets": this sim refuses to invent
+            // kinematics, so a pose frame would be silently dropped — and advertising a verb
+            // the double ignores is how a client learns exactly the wrong lesson (the SDK's
+            // sendPose gate throws against this ack, which is the correct teaching).
+            capabilities: ["task_jog", "record"],
             norm_mode: "range_m100_100",
             watchdog_profile: { ...this.watchdog },
             descriptor: JSON.parse(JSON.stringify(this.descriptor)),
@@ -123,6 +137,8 @@ export class MockDaemonSim {
                 session_open: this.recSessionOpen, episode: this.recEpisode ?? undefined,
                 episodes_kept: this.recKept, free_gb: 42.0,
             };
+            if (this.recStereo)
+                s.stereo = true;
             if (error)
                 s.error = error;
             return s;
@@ -134,6 +150,7 @@ export class MockDaemonSim {
                 return [status(false, "session already open")];
             this.recSessionOpen = true;
             this.recKept = 0;
+            this.recStereo = frame.stereo === true;
             if (a === "start") {
                 this.recSeq += 1;
                 this.recEpisode = this.epId();
@@ -146,6 +163,7 @@ export class MockDaemonSim {
             if (!this.recSessionOpen) {
                 this.recSessionOpen = true;
                 this.recKept = 0;
+                this.recStereo = frame.stereo === true;
             }
             if (this.recEpisode !== null)
                 return [status(false, "already recording an episode")];
@@ -180,7 +198,9 @@ export class MockDaemonSim {
             }
             this.recSessionOpen = false;
             this.recEpisode = null;
-            return [status(true)];
+            const closing = status(true);
+            this.recStereo = false;
+            return [closing];
         }
         if (a === "session_discard" || a === "discard" || a === "discard_last") {
             if (!this.recSessionOpen)
@@ -188,7 +208,9 @@ export class MockDaemonSim {
             this.recSessionOpen = false;
             this.recEpisode = null;
             this.recKept = 0;
-            return [status(true)];
+            const closing = status(true);
+            this.recStereo = false;
+            return [closing];
         }
         if (a === "status")
             return [status(true)];

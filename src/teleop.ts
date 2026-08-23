@@ -17,6 +17,7 @@ import type { SignalingTransport } from "./signaling";
 import { AudioLatencyProbe, audioLatencyEnabled } from "./audioLatency";
 import { VideoQualityLoop, type VideoNetState } from "./videoQuality";
 import { NORI_PROTOCOL_VERSION } from "./version";
+import { liftJogKey } from "./rail";
 
 export type ControlMode = "cylindrical" | "joint";
 export type ArmSide = "left" | "right";
@@ -134,6 +135,16 @@ export interface TelemetryView {
   // daemon's status.motor_faults (telemetry.json). The raw hex in the string is authoritative;
   // the names are best-effort per the Feetech status byte. Empty on old daemons that don't send it.
   motorFaults: Record<string, string>;
+  // Per-motor servo CASE temperature, whole °C — the daemon's 1 Hz L3-guard sweep
+  // (arms + lifts + wheels), surfaced so an operator can watch a joint warm toward the
+  // 58 °C latch live (telemetry `servo_temps`, 2026-08-09). A motor ABSENT from the map
+  // failed its read that cycle (unknown — never assume cool). Empty {} on old daemons,
+  // the mock, or a robot with the L3 guard disabled.
+  servoTemps: Record<string, number>;
+  // Why the robot is latched ("estop:<reason>" | "overtemp:<motor>" | "overcurrent:<motor>" |
+  // "stall:<motor>"), or null when not latched. Drives persistent operator banners — an
+  // over-temp latch holds for the several MINUTES the servo needs to cool below threshold.
+  latchReason: string | null;
 }
 
 // A single object the on-Pi detector reports (nori-protocol perception.json $items). Fields
@@ -304,9 +315,20 @@ export interface RobotDescriptor {
   buses?: string[];
   joints?: string[];   // every drivable "<motor>.pos" key
   base?: string[];     // base DOFs ("x.vel", "theta.vel")
-  aux?: string[];      // extra actuators (e.g. "left_lift")
+  aux?: string[];      // extra actuators (e.g. "left_lift", or A3's single "lift")
   cameras?: string[];  // camera roles — matches the composite CameraLayout tiles
   ranges?: Record<string, [number, number]>;
+  // How a normalized jog rate [-1,1] converts to NOMINAL COMMANDED motion on this robot
+  // (nori-protocol ack.json / MODELS.md "Knowing how fast 1.0 is"). Never achieved
+  // velocity: the watchdog warn state, acceleration limits, and Servo's singularity/
+  // collision scaling all reduce the real rate — verify against telemetry. Absent on the
+  // frozen L2 fleet forever, so absence means UNKNOWN and a caller must not assume.
+  jog_scale?: {
+    joints?: Record<string, number>; // norm_mode units/s per "<name>.pos" at full deflection
+    task?: { x?: number; y?: number; z?: number; pitch?: number; shoulder_pan?: number };
+    base?: { linear?: number; angular?: number }; // m/s, rad/s (JOG namespace keys)
+    lift?: number;                   // mm/s, matching <side>_lift.pos / lift.pos
+  };
 }
 
 // The parsed handshake. `accepted:false` means the daemon refused the session (error says
@@ -322,6 +344,26 @@ export interface RobotInfo {
   initialState?: Record<string, number>; // joint pose at session start ("<name>.pos" -> value)
   error?: string;                        // set when accepted === false
   versionMismatch: boolean;              // daemon protocolVersion differs from this SDK's target
+  // ADVISORY model/generation label ("L2", "A3") for logs and dataset provenance only —
+  // never branch on it; branch on descriptor + capabilities (nori-protocol MODELS.md).
+  model?: string;
+  // Optional verbs this robot honours beyond the always-present core. THREE-VALUED by
+  // design: undefined = the ack predates the field (unknown — probe or assume legacy);
+  // [] = explicitly none. Use supportsCapability() rather than .includes() so the
+  // legacy case stays visible. Known values include "task_jog", "pose_targets",
+  // "record", "leader_action_deg", "lift_targets", "policy_stream", "call".
+  capabilities?: string[];
+}
+
+// Three-valued capability check (mirrors nori-sdk-py RobotInfo.supports): true/false when
+// the robot declared its capabilities, undefined when the ack predates the field — callers
+// must treat undefined as "unknown, probe or assume legacy", never as false.
+export function supportsCapability(
+  info: RobotInfo | null | undefined, capability: string,
+): boolean | undefined {
+  const caps = info?.capabilities;
+  if (caps === undefined) return undefined;
+  return caps.includes(capability);
 }
 
 // Coerce a wire `ack` frame into a RobotInfo. Tolerant of old daemons that send a bare
@@ -350,6 +392,11 @@ export function parseAck(
         : undefined,
     error: typeof m.error === "string" ? m.error : undefined,
     versionMismatch: protocolVersion !== undefined && protocolVersion !== sdkProtocolVersion,
+    model: typeof m.model === "string" && m.model ? m.model : undefined,
+    capabilities:
+      Array.isArray(m.capabilities) && m.capabilities.every((c) => typeof c === "string")
+        ? (m.capabilities as string[])
+        : undefined,
   };
 }
 
@@ -371,6 +418,22 @@ export interface CallState {
   cameraOn: boolean;     // M6 (gated): operator camera is sending
 }
 
+// Policy-stream control replies ({type:"policy_stream_status"} frames): the robot's
+// always-on policy streamer (rpi5/media/policy_streamer.py) relayed through the
+// bridge, same pattern as record_status below. `dropped` is the honest congestion
+// signal — frames the robot's bounded newest-wins buffer discarded. `error` covers
+// both refusals ("streamer unreachable" = feature disabled/absent on this robot,
+// a definite no) and mid-run deaths ("sink timeout", "camera silence").
+export interface PolicyStreamStatus {
+  ok: boolean;
+  streaming: boolean;
+  dest: string | null;
+  fpsOut?: number;
+  framesSent?: number;
+  dropped?: number;
+  error?: string;
+}
+
 // W2.11 on-robot episode recording: the reply to a record() command, relayed by the
 // bridge from the robot's always-on recorder ({type:"record_status"} frames). Null
 // until the first reply — record({action:"status"}) on connect is the cheap probe.
@@ -383,6 +446,12 @@ export interface RecordState {
   episodesKept?: number; // episodes kept in the open session so far
   episode?: string;      // "<session>/<episode-NNNN>" while recording
   freeGb?: number;       // spool disk headroom on the robot
+  // Stereo-view enforcement is active for the open session: the robot is
+  // recording the front + overhead cameras at one matched frame rate (the
+  // session was started with record(..., { stereo: true }) and the robot
+  // acknowledged it). Absent on robots that predate the stereo vocabulary,
+  // so the UI can distinguish "enforcing" from "silently ignored".
+  stereo?: boolean;
   error?: string;
 }
 
@@ -403,6 +472,12 @@ export interface RemoteTeleopOptions {
   turnUrls: string[];
   turnUser: string;
   turnCred: string;
+  // Pentest V1 (robot-session grant). `cert` is a PRE-GENERATED DTLS certificate: the caller
+  // reads its sha-256 fingerprint, mints `sessionGrant` bound to that fingerprint, and passes
+  // both here so the live peer uses the same cert the grant is bound to. Both optional — an
+  // anonymous LAN session (no grant) omits them and the peer auto-generates a cert as before.
+  cert?: RTCCertificate;
+  sessionGrant?: string;
   forceRelay: boolean;
   arm: ArmSide;
   // Initial keyboard control mode. Defaults to "cylindrical". The page passes its current
@@ -451,6 +526,10 @@ export interface RemoteTeleopOptions {
   // Optional: on-robot episode recording state (W2.11) — fires on every record_status
   // reply to a record() command. Poll recordState() for the latest value at use-time.
   onRecord?: (s: RecordState) => void;
+  // Optional: policy-stream state — fires on every policy_stream_status reply to a
+  // policyStream() command (incl. the mid-run death statuses). Poll
+  // policyStreamStatus() for the latest value at use-time.
+  onPolicyStream?: (s: PolicyStreamStatus) => void;
 }
 
 // Two schemes; 'm' toggles. Default = CYLINDRICAL (the rpi4 feel).
@@ -472,6 +551,66 @@ export const JOINT_KEYS: Record<string, [string, number]> = {
   t: ["wrist_roll", 1], g: ["wrist_roll", -1],
   y: ["gripper", 1], h: ["gripper", -1],
 };
+// ---- L3: descriptor-driven per-motor jog (additive; L2 byte-identical) ----
+// L2 daemons advertise (or predate) the classic 6-DOF vocabulary in
+// JOINT_KEYS; the L3 gateway's ack descriptor advertises its real arm joints
+// ("right_arm_shoulder_pitch.pos", ...). Only when a descriptor names arm
+// joints OUTSIDE the L2 set does per-motor mode derive its keymap from the
+// descriptor. No descriptor, or the L2 vocabulary, keeps the exact legacy
+// map — every deployed L2 behaves identically.
+const L2_JOINT_SHORTS = new Set([
+  "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper",
+]);
+// Anatomical display/keyboard order for known L3 joints; unknown joints sort last.
+const L3_PREFERRED_ORDER = [
+  "shoulder_pitch", "shoulder_roll", "bicep_yaw", "elbow_pitch",
+  "forearm_yaw", "wrist_pitch", "wrist_roll",
+];
+// Key pairs for dynamically-mapped joints, row order. Deliberately avoids
+// i/k/j/l (base), u/o (lift), m (mode toggle) and space/p/c (commands).
+const DYNAMIC_KEY_PAIRS: [string, string][] = [
+  ["q", "a"], ["w", "s"], ["e", "d"], ["r", "f"],
+  ["t", "g"], ["y", "h"], ["z", "x"], ["b", "n"],
+];
+
+// The descriptor's arm-joint short names for one arm, or null when the robot
+// speaks the L2 vocabulary (=> use the legacy JOINT_KEYS untouched).
+export function l3JointShorts(
+  descriptor: RobotDescriptor | undefined | null, arm: string,
+): string[] | null {
+  const joints = descriptor?.joints;
+  if (!joints) return null;
+  const prefix = `${arm}_arm_`;
+  const shorts: string[] = [];
+  for (const key of joints) {
+    if (!key.startsWith(prefix) || !key.endsWith(".pos")) continue;
+    const short = key.slice(prefix.length, -".pos".length);
+    if (short !== "gripper") shorts.push(short);
+  }
+  if (!shorts.length || shorts.every((s) => L2_JOINT_SHORTS.has(s))) return null;
+  const rank = (s: string) => {
+    const i = L3_PREFERRED_ORDER.indexOf(s);
+    return i < 0 ? L3_PREFERRED_ORDER.length : i;
+  };
+  shorts.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  return shorts;
+}
+
+// Build a per-motor keymap for descriptor-advertised joints. The gripper
+// always keeps the last pair, so it can never fall off the keyboard.
+export function jointKeymapForShorts(
+  shorts: string[],
+): Record<string, [string, number]> {
+  const dofs = [...shorts.slice(0, DYNAMIC_KEY_PAIRS.length - 1), "gripper"];
+  const map: Record<string, [string, number]> = {};
+  dofs.forEach((short, i) => {
+    const [pos, neg] = DYNAMIC_KEY_PAIRS[i];
+    map[pos] = [short, 1];
+    map[neg] = [short, -1];
+  });
+  return map;
+}
+
 export const BASE_KEYS: Record<string, [string, number]> = {
   i: ["linear", 1], k: ["linear", -1], j: ["angular", 1], l: ["angular", -1],
   // WASD alias for the same base DOFs. jogTick gives the ARM keymap first claim on a
@@ -520,7 +659,7 @@ export function baseKeyClusters(): BaseKeyCluster[] {
 
 // Structured control legend for a given mode — derived from the exported maps above so it
 // can never drift from what the keys actually send.
-export function keybindLegend(mode: ControlMode): {
+export function keybindLegend(mode: ControlMode, jointShorts?: string[] | null): {
   arm: KeybindRow[];
   base: KeybindRow[];
   lift: KeybindRow;
@@ -528,7 +667,10 @@ export function keybindLegend(mode: ControlMode): {
 } {
   const [u, o] = Object.entries(ZLIFT_KEYS).sort((a, b) => b[1] - a[1]).map(([k]) => k);
   return {
-    arm: rowsFromAxisMap(mode === "joint" ? JOINT_KEYS : TASK_KEYS),
+    arm: rowsFromAxisMap(
+      mode === "joint"
+        ? (jointShorts ? jointKeymapForShorts(jointShorts) : JOINT_KEYS)
+        : TASK_KEYS),
     base: rowsFromAxisMap(BASE_KEYS),
     lift: { dof: "lift (selected arm)", posKey: u, negKey: o },
     commands: [
@@ -592,7 +734,7 @@ export class RemoteTeleop {
   // frame — keep last values so the readout doesn't flicker to 0.
   private tel: TelemetryView = {
     loopHz: 0, safety: "-", watchdog: "-", tempC: 0, active: false, linkMode: null, currents: {},
-    state: {}, videoNet: null, batteryPercent: null, motorFaults: {},
+    state: {}, videoNet: null, batteryPercent: null, motorFaults: {}, servoTemps: {}, latchReason: null,
   };
   private stopped = false;
   // Latest world-state from the daemon perception process (Phase F). null until a frame arrives
@@ -613,6 +755,8 @@ export class RemoteTeleop {
   private cameraLayoutRaw: CameraLayout | null = null;
   private daemonStat: DaemonStatus | null = null;   // latest daemon_status (bridge health frame)
   private recStat: RecordState | null = null;       // latest record_status (W2.11 recorder reply)
+  private psStat: PolicyStreamStatus | null = null; // latest policy_stream_status
+  private psWaiters: Array<(s: PolicyStreamStatus) => void> = []; // FIFO, one per in-flight policyStream()
   // The parsed handshake ack (P4.1). null until the daemon's ack arrives; refreshed on every
   // daemon (re)connect (a fresh offer means a fresh session, and the daemon re-acks).
   private ackInfo: RobotInfo | null = null;
@@ -789,6 +933,94 @@ export class RemoteTeleop {
     return `a${++this.actionSeq}`;
   }
 
+  // Send an absolute Cartesian pose target for ONE arm's gripper TCP (nori-protocol
+  // control.pose; capability "pose_targets"). The robot solves IK ON-BOARD — the wire never
+  // carries joint solutions — then latches and tracks the result exactly like sendAction:
+  // a zero jog does not cancel it, the watchdog's t_stop drops it. Lifecycle rides the
+  // action_id through action_status (awaitAction resolves on the terminal state; the
+  // intermediate "active" means solved-and-tracking). Failure is a modelled `blocked`
+  // reason, not an exception: "no_ik_solution" (full pose: not retriable at this lift
+  // height; position-only: wrist-dependent, retry with an orientation), "ik_timeout"
+  // (retry), "limit:<joint>", "singularity", "collision", "lift_moved" (re-send to
+  // re-solve), "config_jump" (split the move into waypoints), "frame:<name>".
+  //
+  // Conventions (NORMATIVE, nori-protocol control.json): metres in base_footprint, REP-103
+  // (+x forward, +y left, +z up), quaternion [x, y, z, w]. OMIT the orientation for "get
+  // the gripper to this point, any wrist angle" — the robot solves at its current wrist.
+  //
+  // THROWS if the robot's ack EXPLICITLY lacks "pose_targets" (the frame would be silently
+  // ignored — a hung move with no error is worse than a throw). An ack that predates
+  // capabilities entirely passes through: probe-or-assume-legacy is the ack contract.
+  // Malformed vectors also throw here rather than costing a round trip to a "bad_pose".
+  sendPose(
+    side: "left" | "right",
+    positionM: [number, number, number] | number[],
+    orientationXyzw?: [number, number, number, number] | number[],
+    actionId?: string,
+  ) {
+    if (supportsCapability(this.ackInfo, "pose_targets") === false) {
+      throw new Error(
+        "this robot does not advertise the pose_targets capability — a pose frame would " +
+        "be silently ignored");
+    }
+    if (side !== "left" && side !== "right") {
+      throw new Error(`sendPose: side must be "left" or "right", got ${String(side)}`);
+    }
+    if (positionM.length !== 3) {
+      throw new Error(`sendPose: positionM needs [x, y, z] metres, got ${positionM.length}`);
+    }
+    if (orientationXyzw !== undefined && orientationXyzw.length !== 4) {
+      throw new Error(
+        `sendPose: orientationXyzw needs [x, y, z, w], got ${orientationXyzw.length}`);
+    }
+    const target: Record<string, unknown> = {
+      frame: "base_footprint",
+      position_m: [...positionM],
+    };
+    if (orientationXyzw !== undefined) target.orientation_xyzw = [...orientationXyzw];
+    const frame: Record<string, unknown> = {
+      type: "control", seq: this.seq++, pose: { [`${side}_arm`]: target },
+    };
+    if (actionId) frame.action_id = actionId;
+    this.dcSend(frame);
+  }
+
+  // Drive the robot's policy streamer (STREAM_INTEGRATION_PLAN §3): the observation
+  // leg of remote inference. `start` makes the ROBOT dial out to `target` (the
+  // lelab receiver from /nori/rollout/stream/open) and push full-quality frames.
+  // Resolves with the robot's reply, or a synthetic timeout error after `timeoutMs`
+  // — never rejects (the awaitAction contract). Default 12 s because the robot-side
+  // relay legitimately blocks up to ~8 s on `start` (sink connect + preamble); a
+  // shorter wait reports "timeout" while the stream then actually starts.
+  policyStream(
+    action: "start" | "stop" | "status",
+    opts?: { dest?: "laptop" | "cloud"; target?: string; token?: string; timeoutMs?: number },
+  ): Promise<PolicyStreamStatus> {
+    const frame: Record<string, unknown> = { type: "policy_stream", action };
+    if (opts?.dest) frame.dest = opts.dest;
+    if (opts?.target) frame.target = opts.target;
+    // Pentest V10 sink auth: the robot must echo this token in its stream preamble.
+    // Travels over the authenticated datachannel, so an off-channel attacker never sees it.
+    if (opts?.token) frame.token = opts.token;
+    return new Promise<PolicyStreamStatus>((resolve) => {
+      const timer = setTimeout(() => {
+        const i = this.psWaiters.indexOf(entry);
+        if (i >= 0) this.psWaiters.splice(i, 1);
+        resolve({ ok: false, streaming: false, dest: null,
+                  error: `policy_stream ${action}: no reply in ${opts?.timeoutMs ?? 12000}ms` });
+      }, opts?.timeoutMs ?? 12000);
+      const entry = (s: PolicyStreamStatus) => { clearTimeout(timer); resolve(s); };
+      this.psWaiters.push(entry);
+      this.dcSend(frame);
+    });
+  }
+
+  // Latest policy_stream_status seen (any), or null. The mid-run death statuses
+  // ("sink timeout", "camera silence") land here even with no command in flight.
+  policyStreamStatus(): PolicyStreamStatus | null {
+    return this.psStat;
+  }
+
   // Hand the arms to an autonomous policy (or take them back). While on, the 50 Hz
   // jog tick drops the leader's absolute targets and held keys so only sendAction()
   // drives the arms — otherwise the ever-present jog frame out-votes the policy and
@@ -860,13 +1092,23 @@ export class RemoteTeleop {
       | "session_end" | "session_discard"
       | "start" | "stop" | "discard" | "discard_last" | "status",
     task?: string,
+    opts?: {
+      // Ask the robot to enforce stereo capture for this session: the front and
+      // overhead cameras record at one matched frame rate so their frames pair
+      // into a stereo view. Session-scoped — set it on session_start (and on
+      // episode_start, which carries it for the same dropped-session_start
+      // recovery as `task`). The robot echoes `stereo: true` in record_status
+      // while enforcing; older robots ignore the field entirely.
+      stereo?: boolean;
+    },
   ) {
     const msg: Record<string, unknown> = { type: "record", action };
     // Task rides episode_start too: if session_start dropped on the unreliable
     // control channel, the robot auto-opens a session on episode_start and needs
     // the task from here so it isn't lost.
-    if ((action === "start" || action === "session_start" || action === "episode_start") && task) {
-      msg.task = task;
+    if (action === "start" || action === "session_start" || action === "episode_start") {
+      if (task) msg.task = task;
+      if (opts?.stereo) msg.stereo = true;
     }
     this.dcSend(msg);
   }
@@ -1359,7 +1601,26 @@ export class RemoteTeleop {
   }
 
   private sendReady() {
-    this.o.signaling.sendReady({});
+    // Forward this session's TURN creds so the ROBOT can gather relay candidates
+    // too. Without them a host-only robot is unreachable through a relay (the
+    // relay can't route to LAN/tailnet addrs, and coturn drops the robot's
+    // inbound checks — its public addr was never signaled, so no permission
+    // exists). Creds are short-lived and backend-minted; see ReadyTurn.
+    const turn = this.o.turnUrls.length
+      ? { urls: this.o.turnUrls, username: this.o.turnUser, credential: this.o.turnCred }
+      : undefined;
+    // Pentest V1: carry the DTLS-fingerprint-bound session grant so the robot can authorize
+    // motion independently of Supabase RLS. Inert until the gateway's require_session_grant
+    // flag flips; a warm-mode gateway ignores an unknown sibling.
+    // NOTE (open, coordinate with the gateway half): the gateway DEDUPES `ready`
+    // (_start_session returns if a session already exists), so re-sending `ready` won't
+    // deliver a REFRESHED grant for the in-session re-verify (V8). The initial-handshake
+    // grant below is correct; the ~90s refresh transport (re-sent ready vs a datachannel
+    // control frame) is pending the gateway's re-verify mechanism — not built here yet.
+    this.o.signaling.sendReady({
+      ...(turn ? { turn } : {}),
+      ...(this.o.sessionGrant ? { grant: this.o.sessionGrant } : {}),
+    });
   }
 
   private freshPeer(): RTCPeerConnection {
@@ -1369,6 +1630,10 @@ export class RemoteTeleop {
     const pc = new RTCPeerConnection({
       iceServers: this.iceServers(),
       iceTransportPolicy: this.o.forceRelay ? "relay" : "all",
+      // Pentest V1: pin the DTLS identity to the pre-generated cert the session grant is bound
+      // to (getFingerprints() of this cert == the grant's dtls_fp). Omitted => auto-generated
+      // cert (anonymous/legacy path). Must be set at construction; a cert can't be swapped in.
+      ...(this.o.cert ? { certificates: [this.o.cert] } : {}),
     });
     this.pc = pc;
     this.latencyProbe?.stop();
@@ -1536,10 +1801,13 @@ export class RemoteTeleop {
       if (typeof m.loop_hz === "number") this.tel.loopHz = m.loop_hz;
       if (typeof m.pi_temp_c === "number" && m.pi_temp_c > 0) this.tel.tempC = m.pi_temp_c;
       const status = m.status as
-        | { safety?: string; watchdog?: string; motor_faults?: Record<string, string> }
+        | { safety?: string; watchdog?: string; latch_reason?: string | null;
+            motor_faults?: Record<string, string> }
         | undefined;
       if (status) {
         if (status.safety) this.tel.safety = status.safety;
+        // null/absent -> not latched; replace wholesale so a cleared latch drops the banner.
+        this.tel.latchReason = typeof status.latch_reason === "string" ? status.latch_reason : null;
         if (status.watchdog) this.tel.watchdog = status.watchdog;
         // Per-motor hardware faults. The daemon sends the FULL current fault set in each status
         // block (and omits the field entirely when nothing is faulted), so replace wholesale —
@@ -1548,6 +1816,11 @@ export class RemoteTeleop {
         this.tel.motorFaults =
           status.motor_faults && typeof status.motor_faults === "object" ? status.motor_faults : {};
       }
+      // Per-motor servo case temps (1 Hz sweep). Only present on periodic blocks from
+      // new daemons; replace wholesale when present so a recovered read updates cleanly,
+      // and keep the last sweep otherwise (same no-flicker rule as loop_hz/status).
+      if (m.servo_temps && typeof m.servo_temps === "object")
+        this.tel.servoTemps = m.servo_temps as Record<string, number>;
       // Per-motor Present_Current (virtual tactile signal) -> VR haptics + on-screen readout.
       if (m.currents && typeof m.currents === "object") {
         this.tel.currents = m.currents as Record<string, number>;
@@ -1587,6 +1860,8 @@ export class RemoteTeleop {
       this.ingestDaemonStatus(m);
     } else if (m.type === "record_status") {
       this.ingestRecordStatus(m);
+    } else if (m.type === "policy_stream_status") {
+      this.ingestPolicyStream(m);
     } else if (m.type === "ack") {
       this.ingestAck(m);
     } else if (m.type === "error") {
@@ -1659,7 +1934,10 @@ export class RemoteTeleop {
         `v${NORI_PROTOCOL_VERSION}. Proceeding (unknown frames are ignored by both sides); ` +
         `expect vocabulary gaps, not unsafe behavior.`);
     }
+    this.dynamicKeymap = null;   // rebuild the per-motor map from this ack
     const d = info.descriptor;
+    const l3 = l3JointShorts(d, this.o.arm);
+    if (l3) this.log(`descriptor-driven per-motor jog: ${l3.length} arm joints`);
     this.log("robot ack: accepted=" + info.accepted +
       (info.protocolVersion !== undefined ? ` protocol=v${info.protocolVersion}` : "") +
       (info.normMode ? ` norm=${info.normMode}` : "") +
@@ -1719,6 +1997,28 @@ export class RemoteTeleop {
     return this.daemonStat;
   }
 
+  // Coerce a policy_stream_status reply (fields per rpi5/media/policy_streamer.py
+  // _status), cache it, resolve the oldest in-flight policyStream() call, notify.
+  // FIFO waiter resolution: replies arrive in command order over the ordered data
+  // channel, so the oldest waiter owns the next reply.
+  private ingestPolicyStream(m: Record<string, unknown>) {
+    const s: PolicyStreamStatus = {
+      ok: m.ok === true,
+      streaming: m.streaming === true,
+      dest: typeof m.dest === "string" ? m.dest : null,
+    };
+    if (typeof m.fps_out === "number") s.fpsOut = m.fps_out;
+    if (typeof m.frames_sent === "number") s.framesSent = m.frames_sent;
+    if (typeof m.dropped === "number") s.dropped = m.dropped;
+    if (typeof m.error === "string" && m.error) s.error = m.error;
+    this.psStat = s;
+    this.log(s.error ? `policy stream: ${s.error}`
+      : s.streaming ? `policy stream live -> ${s.dest} (${s.fpsOut ?? "?"} fps, ${s.dropped ?? 0} dropped)`
+      : "policy stream idle");
+    this.psWaiters.shift()?.(s);
+    this.o.onPolicyStream?.(s);
+  }
+
   // W2.11: coerce a record_status reply (fields per rpi5/media/recorder.py _status),
   // cache it, notify. Replies are direct answers to record() commands — no dedupe
   // (a repeated "status" probe legitimately returns the same state, and free_gb drifts).
@@ -1731,6 +2031,7 @@ export class RemoteTeleop {
     if (typeof m.episodes_kept === "number") s.episodesKept = m.episodes_kept;
     if (typeof m.episode === "string" && m.episode) s.episode = m.episode;
     if (typeof m.free_gb === "number") s.freeGb = m.free_gb;
+    if (m.stereo === true) s.stereo = true;
     if (typeof m.error === "string" && m.error) s.error = m.error;
     this.recStat = s;
     this.log(s.error ? `recorder: ${s.error}`
@@ -1799,8 +2100,26 @@ export class RemoteTeleop {
     }
   }
 
+  // NOTE: the handshake lives in `ackInfo` (declared above) and is read through the public
+  // robotInfo() accessor. There used to be a SECOND private field named `robotInfo` here
+  // holding the same value — which shadowed that method on every instance, so
+  // `teleop.robotInfo()` threw "is not a function" for the whole life of the session.
+  private dynamicKeymap: { arm: string; map: Record<string, [string, number]> } | null = null;
+
+  // Descriptor shorts for the CURRENTLY selected arm, or null on L2 robots.
+  // Public so the page can render the matching legend.
+  armJointShorts(): string[] | null {
+    return l3JointShorts(this.ackInfo?.descriptor, this.o.arm);
+  }
+
   private armKeymap() {
-    return this.mode === "joint" ? JOINT_KEYS : TASK_KEYS;
+    if (this.mode !== "joint") return TASK_KEYS;
+    const cached = this.dynamicKeymap;
+    if (cached && cached.arm === this.o.arm) return cached.map;
+    const shorts = this.armJointShorts();
+    const map = shorts ? jointKeymapForShorts(shorts) : JOINT_KEYS;
+    this.dynamicKeymap = { arm: this.o.arm, map };
+    return map;
   }
 
   private setMode(m: ControlMode) {
@@ -1873,9 +2192,11 @@ export class RemoteTeleop {
     const km = this.armKeymap();
     // joint mode: always send all 6 joint fields (0 default) so the daemon picks the
     // per-motor path. cylindrical mode: send only task DOFs -> daemon task/IK path.
+    // Derived from the ACTIVE keymap, so it is the L2 literal for JOINT_KEYS
+    // and the descriptor's joints for an L3 map — never a stale vocabulary.
     const a: Record<string, number> =
       this.mode === "joint"
-        ? { shoulder_pan: 0, shoulder_lift: 0, elbow_flex: 0, wrist_flex: 0, wrist_roll: 0, gripper: 0 }
+        ? Object.fromEntries(Object.values(km).map(([dof]) => [dof, 0]))
         : {};
     const base: Record<string, number> = {};
     let z = 0;
@@ -1888,9 +2209,10 @@ export class RemoteTeleop {
       // While a leader source drives the arms, arm keys are ignored (leader wins on those
       // joints); base + lift keys still apply so the operator drives the base/rails by hand.
       if (!leader && k in km) { const [d, s] = km[k]; a[d] = s * sp; }
-      // Firmware turns the base opposite our "+angular = left" convention, so negate the
-      // angular sign on the wire (keeps BASE_KEYS/legend reading a,j = left, and now true).
-      else if (k in BASE_KEYS) { const [dof, s] = BASE_KEYS[k]; base[dof] = (dof === "angular" ? -s : s) * sp; }
+      // Firmware drives the base opposite our sign convention on BOTH axes (+linear =
+      // forward, +angular = left), so negate on the wire — keeps BASE_KEYS/legend reading
+      // naturally (i/w = forward, a/j = left) while sending what the firmware actually wants.
+      else if (k in BASE_KEYS) { const [dof, s] = BASE_KEYS[k]; base[dof] = -s * sp; }
       else if (k in ZLIFT_KEYS) z = ZLIFT_KEYS[k] * sp;
     }
     // Leader mode: arms come from leader_action_deg, so the jog carries only base + lift.
@@ -1899,8 +2221,15 @@ export class RemoteTeleop {
     // keeps the daemon's latest_jog fresh so a released base key can't latch its last speed.
     const jog: Record<string, unknown> = leader ? { base } : { [`${this.o.arm}_arm`]: a };
     if (!leader && Object.keys(base).length) jog.base = base;
-    // u/o lift the CURRENTLY SELECTED arm (the dropdown that scopes the arm keys).
-    if (z) jog[`${this.o.arm}_lift`] = z;
+    // u/o lift the CURRENTLY SELECTED arm (the dropdown that scopes the arm keys) on a robot
+    // with per-arm rails; on an A-series robot there is ONE central column and both arm
+    // selections drive it. Resolved from the descriptor rather than composed as
+    // `${arm}_lift`, which named a key an A3 does not have — the robot ignored it in silence,
+    // so the operator's lift keys did nothing at all and reported nothing.
+    if (z) {
+      const lk = liftJogKey(this.ackInfo?.descriptor, this.o.arm);
+      if (lk) jog[lk] = z;
+    }
     const frame: Record<string, unknown> = { type: "control", seq: this.seq++, jog };
     if (leader) frame.leader_action_deg = leader;
     this.dcSend(frame);

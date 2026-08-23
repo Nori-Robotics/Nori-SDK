@@ -35,6 +35,7 @@ export declare class MockDaemonSim {
     private recEpisode;
     private recKept;
     private recSeq;
+    private recStereo;
     private handleRecord;
     private epId;
     private handleControl;

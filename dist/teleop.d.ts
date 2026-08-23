@@ -27,6 +27,8 @@ export interface TelemetryView {
     videoNet: VideoNetState | null;
     batteryPercent: number | null;
     motorFaults: Record<string, string>;
+    servoTemps: Record<string, number>;
+    latchReason: string | null;
 }
 export interface PerceivedObject {
     label: string;
@@ -88,6 +90,21 @@ export interface RobotDescriptor {
     aux?: string[];
     cameras?: string[];
     ranges?: Record<string, [number, number]>;
+    jog_scale?: {
+        joints?: Record<string, number>;
+        task?: {
+            x?: number;
+            y?: number;
+            z?: number;
+            pitch?: number;
+            shoulder_pan?: number;
+        };
+        base?: {
+            linear?: number;
+            angular?: number;
+        };
+        lift?: number;
+    };
 }
 export interface RobotInfo {
     accepted: boolean;
@@ -98,7 +115,10 @@ export interface RobotInfo {
     initialState?: Record<string, number>;
     error?: string;
     versionMismatch: boolean;
+    model?: string;
+    capabilities?: string[];
 }
+export declare function supportsCapability(info: RobotInfo | null | undefined, capability: string): boolean | undefined;
 export declare function parseAck(m: Record<string, unknown>, sdkProtocolVersion?: number): RobotInfo;
 export interface CallState {
     active: boolean;
@@ -109,6 +129,15 @@ export interface CallState {
     robotMicMuted: boolean;
     cameraOn: boolean;
 }
+export interface PolicyStreamStatus {
+    ok: boolean;
+    streaming: boolean;
+    dest: string | null;
+    fpsOut?: number;
+    framesSent?: number;
+    dropped?: number;
+    error?: string;
+}
 export interface RecordState {
     ok: boolean;
     recording: boolean;
@@ -116,6 +145,7 @@ export interface RecordState {
     episodesKept?: number;
     episode?: string;
     freeGb?: number;
+    stereo?: boolean;
     error?: string;
 }
 export interface RemoteTeleopOptions {
@@ -126,6 +156,8 @@ export interface RemoteTeleopOptions {
     turnUrls: string[];
     turnUser: string;
     turnCred: string;
+    cert?: RTCCertificate;
+    sessionGrant?: string;
     forceRelay: boolean;
     arm: ArmSide;
     mode?: ControlMode;
@@ -144,9 +176,12 @@ export interface RemoteTeleopOptions {
     onDaemonStatus?: (s: DaemonStatus) => void;
     onReady?: (info: RobotInfo) => void;
     onRecord?: (s: RecordState) => void;
+    onPolicyStream?: (s: PolicyStreamStatus) => void;
 }
 export declare const TASK_KEYS: Record<string, [string, number]>;
 export declare const JOINT_KEYS: Record<string, [string, number]>;
+export declare function l3JointShorts(descriptor: RobotDescriptor | undefined | null, arm: string): string[] | null;
+export declare function jointKeymapForShorts(shorts: string[]): Record<string, [string, number]>;
 export declare const BASE_KEYS: Record<string, [string, number]>;
 export declare const ZLIFT_KEYS: Record<string, number>;
 export declare const CMD_KEYS: Record<string, string>;
@@ -162,7 +197,7 @@ export interface BaseKeyCluster {
     right: string;
 }
 export declare function baseKeyClusters(): BaseKeyCluster[];
-export declare function keybindLegend(mode: ControlMode): {
+export declare function keybindLegend(mode: ControlMode, jointShorts?: string[] | null): {
     arm: KeybindRow[];
     base: KeybindRow[];
     lift: KeybindRow;
@@ -205,6 +240,8 @@ export declare class RemoteTeleop {
     private cameraLayoutRaw;
     private daemonStat;
     private recStat;
+    private psStat;
+    private psWaiters;
     private ackInfo;
     private micStream;
     private micTrack;
@@ -227,6 +264,14 @@ export declare class RemoteTeleop {
     setLeaderAction(leader: LeaderActionDeg | null): void;
     sendAction(action: Record<string, number>, actionId?: string): void;
     nextActionId(): string;
+    sendPose(side: "left" | "right", positionM: [number, number, number] | number[], orientationXyzw?: [number, number, number, number] | number[], actionId?: string): void;
+    policyStream(action: "start" | "stop" | "status", opts?: {
+        dest?: "laptop" | "cloud";
+        target?: string;
+        token?: string;
+        timeoutMs?: number;
+    }): Promise<PolicyStreamStatus>;
+    policyStreamStatus(): PolicyStreamStatus | null;
     setPolicyDriving(on: boolean): void;
     actionStatus(id: string): ActionStatus | null;
     awaitAction(id: string, opts?: {
@@ -234,7 +279,9 @@ export declare class RemoteTeleop {
     }): Promise<ActionStatus>;
     command(cmd: "estop" | "reset_latch" | "reset"): void;
     setVideoQuality(quality: "low" | "normal" | number): void;
-    record(action: "session_start" | "episode_start" | "episode_stop" | "episode_discard" | "session_end" | "session_discard" | "start" | "stop" | "discard" | "discard_last" | "status", task?: string): void;
+    record(action: "session_start" | "episode_start" | "episode_stop" | "episode_discard" | "session_end" | "session_discard" | "start" | "stop" | "discard" | "discard_last" | "status", task?: string, opts?: {
+        stereo?: boolean;
+    }): void;
     pauseVideo(): void;
     resumeVideo(): void;
     /** Current encoder gate state, so a transient consumer (e.g. a policy rollout that
@@ -282,6 +329,7 @@ export declare class RemoteTeleop {
     cameraLayoutInfo(): CameraLayout | null;
     private ingestDaemonStatus;
     daemonStatus(): DaemonStatus | null;
+    private ingestPolicyStream;
     private ingestRecordStatus;
     recordState(): RecordState | null;
     cameraLayout(): string | null;
@@ -294,6 +342,8 @@ export declare class RemoteTeleop {
         objects: PerceivedObject[];
     }): void;
     private dcSend;
+    private dynamicKeymap;
+    armJointShorts(): string[] | null;
     private armKeymap;
     private setMode;
     private sendCmd;

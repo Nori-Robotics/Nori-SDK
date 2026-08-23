@@ -28,7 +28,7 @@
 //
 // No external assets (CSP-safe) — every part is a box/cylinder primitive.
 import * as THREE from "three";
-import { railReading } from "./rail";
+import { railReading, liftAxes } from "./rail";
 // Clamped normalized joint value (≈ degrees, see header). Missing key -> 0 (rest pose).
 function jointDeg(state, key) {
     const n = state[key];
@@ -147,7 +147,6 @@ export function buildRobotModel(opts = {}) {
     root.add(cyl(0.05, 0.04, 0x202121, [-0.16, 0.379, -0.22], mats));
     // body
     root.add(box(0.25, 1.0, 0.1, M(0x5e6268), [0, 1.0, 0]));
-    root.add(box(0.19, 0.22, 0.19, M(0x7a7e84), [0, 0.7, -0.12]));
     root.add(box(0.33, 0.12, 0.15, shellMat, [0, 1.45, 0]));
     root.add(box(0.15, 0.1, 0.1, shellMat, [0, 1.55, 0]));
     // head
@@ -170,13 +169,21 @@ export function buildRobotModel(opts = {}) {
         root.add(grid);
     }
     const arms = { left: left.parts, right: right.parts };
+    // Resolved once, not per frame. A per-arm rail matches on side; a single central column is
+    // shared by both arms. Falls back to the L-series pair when no descriptor was supplied.
+    const axes = liftAxes(opts.descriptor);
+    const liftAxisFor = (side) => axes.find((a) => a.side === side) ?? axes.find((a) => a.side === null);
     function poseArm(side, state, active) {
         const a = arms[side];
         const p = `${side}_arm_`;
         const sign = side === "left" ? 1 : -1;
         // Rail carriage height for this arm (0 = top, grows downward), clamped so it never
-        // overruns the rail.
-        const { frac } = railReading(state, `${side}_lift.pos`);
+        // overruns the rail. On an A-series robot BOTH arms ride the one central column, so both
+        // resolve to the same axis and move together — which is physically what happens.
+        const axis = liftAxisFor(side);
+        const { frac } = axis
+            ? railReading(state, axis.key, axis.travelMm)
+            : { frac: 0 };
         const visFrac = Math.min(1, frac * RAIL_VIS_GAIN);
         const carriageY = RAIL_TOP_Y - visFrac * RAIL_LEN;
         a.carriage.position.set(sign * 0.015, carriageY, 0);

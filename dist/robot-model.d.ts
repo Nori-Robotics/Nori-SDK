@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import type { RobotDescriptor } from "./teleop";
 import type { ArmSide } from "./teleop";
 /**
  * Which arm(s) render in the green "you are driving this" highlight.
@@ -19,6 +20,16 @@ export interface RobotModel {
 export interface RobotModelOptions {
     /** Floor grid under the robot. Nice for the desktop card; noisy floating in VR. */
     showGrid?: boolean;
+    /**
+     * The robot's ack descriptor, used to resolve WHICH lift it has and how far that lift
+     * travels. Omit it and the model falls back to the L-series per-arm rails at the default
+     * travel — correct for the frozen fleet, which sends no descriptor anyway.
+     *
+     * It matters for the A-series: that robot has ONE central column keyed the bare "lift.pos",
+     * so without this both carriages sat frozen at the top of the rail no matter where the real
+     * lift was.
+     */
+    descriptor?: RobotDescriptor;
 }
 /**
  * Build the robot schematic. Returns a plain three.js object plus an `update()` that re-poses it

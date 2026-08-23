@@ -15,6 +15,8 @@ export declare class SupabaseSignaling implements SignalingTransport {
     private openChannel;
     sendReady(payload: {
         mac?: string;
+        turn?: import("./signaling").ReadyTurn;
+        grant?: string;
     }): void;
     sendSdp(payload: SdpPayload): void;
     sendIce(payload: IcePayload): void;

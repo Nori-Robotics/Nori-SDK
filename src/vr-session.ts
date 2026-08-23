@@ -137,8 +137,8 @@ const TUNE_ZONES = [
 // real robot DOF. State + count come straight from RemoteTeleop.recordState(); a poke calls
 // RemoteTeleop.record(...). See docs/offline_recorder_design.md for the session/episode model.
 const REC_UP = 0.30;   // metres above the right controller (stacked clear of TUNE_UP=0.17)
-const REC_W = 0.21;
-const REC_H = 0.14;    // 1.5:1, matches the 480x320 canvas
+const REC_W = 0.18;
+const REC_H = 0.12;    // 1.5:1, matches the 480x320 canvas
 const REC_POKE_DEPTH = 0.035;   // left tip within this of the panel plane (local m) = a poke
 const REC_POKE_MARGIN = 0.012;  // slack added around each button's rect for the hit-test
 const REC_REARM_DEPTH = 0.07;   // tip must pull this far off the plane before it can fire again
@@ -163,6 +163,15 @@ const HAPTIC_PULSE_MS = 100; // longer pulse per frame -> a more solid, continuo
 // 2D grip-force readout in TeleopStatus can't drift apart.
 const TEL_STALE_MS = 1500; // no telemetry for this long -> HUD control row reads "disconnected"
 const HUD_REDRAW_MS = 250;  // repaint cadence so staleness updates even without new frames
+
+// Idle-presence detection (see VrSessionOptions.onActivity). Tuned to count deliberate input,
+// not controller noise: a driving operator squeezes a grip constantly, so ACTIVITY_PRESS/STICK
+// carry the signal; ACTIVITY_MOVE is a backstop for "present and gesturing without a button".
+const ACTIVITY_PRESS = 0.15;      // squeeze/trigger analog value counted as a real press
+const ACTIVITY_STICK = 0.2;       // |thumbstick| past this = an intentional push, not drift
+const ACTIVITY_MOVE_M = 0.006;    // controller motion between frames (m) over hand micro-jitter
+const ACTIVITY_MOVE_SQ = ACTIVITY_MOVE_M * ACTIVITY_MOVE_M;
+const ACTIVITY_REPORT_MS = 1000;  // throttle the onActivity callback; the clock only needs one
 
 type Hand = "left" | "right";
 // A physical button on one controller: {hand, gamepad button index}. xr-standard indices:
@@ -208,6 +217,12 @@ export interface VrSessionOptions {
   // Fired when the operator changes tuning from INSIDE VR (the right-wrist poke panel),
   // with the full resolved values — the page persists them so its sliders stay in sync.
   onTuningChange?: (t: Required<VrTuning>) => void;
+  // Fired (throttled to ~1 Hz) whenever the operator produces REAL controller input in VR — a
+  // squeeze/trigger/face button, a thumbstick push past deadzone, or perceptible controller
+  // motion. WebXR input surfaces as none of the DOM pointer/key events the app's idle-disconnect
+  // timer watches, so without this an actively-driving operator would be flagged "idle" and
+  // auto-disconnected. The page forwards this to the session's noteActivity().
+  onActivity?: () => void;
 }
 
 // Wrist angles are NOT derived here anymore (2026-07-01). The session forwards the RAW
@@ -255,6 +270,14 @@ export class VrSession {
   private lastHudDraw = 0;
   private resetHeldSince = 0;
   private resetFired = false;
+  // Idle-presence tracking (onActivity). prev*Pos are last frame's controller positions, for the
+  // motion backstop; lastActivityAt throttles the callback. idlePrompt* mirror the app's "Are you
+  // still there?" countdown so it can be drawn in-headset (see setIdlePrompt / drawIdleBanner).
+  private prevLeftPos: [number, number, number] | null = null;
+  private prevRightPos: [number, number, number] | null = null;
+  private lastActivityAt = 0;
+  private idlePromptOpen = false;
+  private idleSecondsLeft = 0;
   // Recenter is a one-shot flag set by the in-VR poke button (recenter()) and serviced on
   // the next frame that has a viewer pose.
   private recenterPending = false;
@@ -352,6 +375,16 @@ export class VrSession {
   // that never reports health isn't shown as offline — telemetry staleness still catches that.
   setMotorsOnline(ok: boolean) {
     this.motorsOnline = ok;
+  }
+
+  // Mirror the app's idle "Are you still there?" countdown into the headset. The 2D dialog is
+  // invisible under an active WebXR session, so without this the operator would be disconnected
+  // with no in-VR warning. Any real controller input (onActivity -> noteActivity) dismisses it.
+  // Repaint immediately so the second-by-second countdown ticks even between HUD redraws.
+  setIdlePrompt(open: boolean, secondsLeft: number) {
+    this.idlePromptOpen = open;
+    this.idleSecondsLeft = secondsLeft;
+    this.drawHud();
   }
 
   // Force a fresh squeeze before driving resumes (after any safe-hold). The page calls
@@ -590,6 +623,12 @@ export class VrSession {
     this.robotYaw = ROBOT_YAW; // next session starts from the default 3/4 view
     this.panelDist = PANEL_DIST; // and from the default cluster distance
     this.lastFrameAt = 0;
+    // Idle-presence tracking resets so a fresh session doesn't inherit stale positions/prompt.
+    this.prevLeftPos = null;
+    this.prevRightPos = null;
+    this.lastActivityAt = 0;
+    this.idlePromptOpen = false;
+    this.idleSecondsLeft = 0;
     this.hudTexture = null;
     this.hudCanvas = null;
     this.hudCtx = null;
@@ -718,6 +757,7 @@ export class VrSession {
         this.updateRecordPanel(vrFrame, dt); // right-wrist glance record-dataset panel
         if (this.recenterPending) this.serviceRecenter(frame, refSpace);
         this.applyHaptics(session);
+        this.detectActivity(vrFrame, nowMs);
       }
     }
     // Re-pose the 3D robot EVERY frame (unlike the HUD's slow repaint below): it's live motion,
@@ -777,6 +817,46 @@ export class VrSession {
       // Touch controllers report the stick on axes[2]/[3]; fall back to [0]/[1] like the reference.
       thumbstick: { x: gp.axes[2] ?? gp.axes[0] ?? 0, y: gp.axes[3] ?? gp.axes[1] ?? 0 },
     };
+  }
+
+  // Decide whether THIS frame shows a present operator, and if so report it (throttled). "Present"
+  // = any deliberate input — a clutch/gripper press, a face/lift/E-STOP button, a thumbstick push
+  // past deadzone — or, as a backstop, perceptible controller motion since the last frame (so
+  // "present and gesturing without touching a button" still counts). Robot telemetry is NOT a
+  // signal: it streams whether or not a human is here (same rule as the DOM idle timer).
+  private detectActivity(f: VrFrame, nowMs: number) {
+    if (!this.o.onActivity) return;
+    const pressed = (v?: number) => (v ?? 0) > ACTIVITY_PRESS;
+    const pushed = (v?: number) => Math.abs(v ?? 0) > ACTIVITY_STICK;
+    const c = f.controls;
+    let active =
+      pressed(f.left?.squeeze) || pressed(f.right?.squeeze) ||
+      pressed(f.left?.trigger) || pressed(f.right?.trigger) ||
+      pushed(f.left?.thumbstick.x) || pushed(f.left?.thumbstick.y) ||
+      pushed(f.right?.thumbstick.x) || pushed(f.right?.thumbstick.y) ||
+      !!(c && (c.leftLiftUp || c.leftLiftDown || c.rightLiftUp || c.rightLiftDown || c.estop));
+    if (!active) {
+      active =
+        this.movedSince(this.prevLeftPos, f.left?.position ?? null) ||
+        this.movedSince(this.prevRightPos, f.right?.position ?? null);
+    }
+    // Track positions every frame (not just when throttled) so the motion delta stays frame-local.
+    if (f.left?.position) this.prevLeftPos = f.left.position;
+    if (f.right?.position) this.prevRightPos = f.right.position;
+
+    if (active && nowMs - this.lastActivityAt >= ACTIVITY_REPORT_MS) {
+      this.lastActivityAt = nowMs;
+      this.o.onActivity();
+    }
+  }
+
+  private movedSince(
+    prev: [number, number, number] | null,
+    cur: [number, number, number] | null,
+  ): boolean {
+    if (!prev || !cur) return false;
+    const dx = cur[0] - prev[0], dy = cur[1] - prev[1], dz = cur[2] - prev[2];
+    return dx * dx + dy * dy + dz * dz > ACTIVITY_MOVE_SQ;
   }
 
   // Recenter on demand — fired by poking the in-VR Recenter button (updateRecenterButton),
@@ -1049,21 +1129,22 @@ export class VrSession {
   // control the operator hunts through mid-task.
   private recZones(): { id: string; x: number; y: number; w: number; h: number; label: string; tone: string }[] {
     if (this.recPhase === "recording") {
-      return [{ id: "episode_stop", x: 0, y: -0.005, w: 0.16, h: 0.062, label: "■ Stop episode", tone: "red" }];
+      return [{ id: "episode_stop", x: 0, y: -0.01, w: 0.12, h: 0.05, label: "■ Stop episode", tone: "red" }];
     }
     if (this.recPhase === "session") {
-      const z = [{ id: "episode_start", x: 0, y: 0.03, w: 0.17, h: 0.055, label: "● Record", tone: "red" }];
+      // Rows sit fully below the title/status text (text bottom ≈ local y 0.034).
+      const z = [{ id: "episode_start", x: 0, y: 0.006, w: 0.12, h: 0.044, label: "● Record", tone: "red" }];
       if (this.recKept > 0) {
         // A take is bankable, so offer Discard-last beside Finish (keep-by-default in VR; no
         // in-headset video review — that's a laptop affordance).
-        z.push({ id: "session_end", x: -0.05, y: -0.042, w: 0.085, h: 0.05, label: "Finish", tone: "slate" });
-        z.push({ id: "episode_discard", x: 0.05, y: -0.042, w: 0.085, h: 0.05, label: "Discard", tone: "darkred" });
+        z.push({ id: "session_end", x: -0.045, y: -0.039, w: 0.075, h: 0.036, label: "Finish", tone: "slate" });
+        z.push({ id: "episode_discard", x: 0.045, y: -0.039, w: 0.075, h: 0.036, label: "Discard", tone: "darkred" });
       } else {
-        z.push({ id: "session_end", x: 0, y: -0.042, w: 0.13, h: 0.05, label: "Finish session", tone: "slate" });
+        z.push({ id: "session_end", x: 0, y: -0.039, w: 0.105, h: 0.036, label: "Finish session", tone: "slate" });
       }
       return z;
     }
-    return [{ id: "session_start", x: 0, y: -0.005, w: 0.16, h: 0.062, label: "Start session", tone: "blue" }];
+    return [{ id: "session_start", x: 0, y: -0.01, w: 0.12, h: 0.05, label: "Start session", tone: "blue" }];
   }
 
   // A poke fired on zone `id`: send the record() command AND advance the local phase
@@ -1230,15 +1311,15 @@ export class VrSession {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillStyle = "#94a3b8";
-    ctx.font = "bold 24px system-ui, sans-serif";
-    ctx.fillText("RECORD DATASET", W / 2, 34);
+    ctx.font = "bold 22px system-ui, sans-serif";
+    ctx.fillText("RECORD DATASET", W / 2, 30);
     const status =
       this.recPhase === "recording" ? `● recording episode ${this.recKept + 1}`
       : this.recPhase === "session" ? `session open · ${this.recKept} kept`
       : "no session open";
     ctx.fillStyle = this.recPhase === "recording" ? "#f87171" : "#cbd5e1";
-    ctx.font = "20px system-ui, sans-serif";
-    ctx.fillText(status, W / 2, 64);
+    ctx.font = "18px system-ui, sans-serif";
+    ctx.fillText(status, W / 2, 58);
 
     const fills: Record<string, string> = {
       blue: "rgba(37,99,235,0.92)",
@@ -1258,7 +1339,7 @@ export class VrSession {
       this.roundRect(ctx, cx - w / 2, cy - h / 2, w, h, 18);
       ctx.stroke();
       ctx.fillStyle = "#f1f5f9";
-      ctx.font = `bold ${z.w >= 0.13 ? 30 : 24}px system-ui, sans-serif`;
+      ctx.font = `bold ${z.w >= 0.1 ? 26 : 21}px system-ui, sans-serif`;
       ctx.fillText(z.label, cx, cy + 1);
     }
     ctx.textAlign = "start"; // restore shared-ctx default
@@ -1445,7 +1526,30 @@ export class VrSession {
       }
     }
 
+    // "Are you still there?" overlay, drawn LAST so it sits above the telemetry. Only reachable in
+    // VR after ~5 min of near-total stillness (any input keeps it away); the fix is to just move —
+    // which fires onActivity and dismisses it. So the banner tells the operator exactly that.
+    if (this.idlePromptOpen) this.drawIdleBanner(ctx, W);
+
     if (this.hudTexture) this.hudTexture.needsUpdate = true;
+  }
+
+  private drawIdleBanner(ctx: CanvasRenderingContext2D, W: number) {
+    const H = 200;
+    ctx.fillStyle = "rgba(239,68,68,0.96)";
+    this.roundRect(ctx, 0, 0, W, H, 28);
+    ctx.fill();
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 42px system-ui, sans-serif";
+    ctx.fillText("ARE YOU STILL THERE?", W / 2, 78);
+    ctx.font = "28px system-ui, sans-serif";
+    ctx.fillText(
+      `Move a controller to stay connected · ${this.idleSecondsLeft}s`,
+      W / 2,
+      130,
+    );
+    ctx.textAlign = "start"; // restore the default the rest of drawHud relies on
   }
 
   private roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {

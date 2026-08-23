@@ -69,6 +69,16 @@ export interface SignalingHandlers {
   onState?: (state: SignalingState) => void;
 }
 
+// Session TURN creds forwarded to the robot inside 'ready': the robot can't hold static relay
+// creds (coturn is use-auth-secret — creds are short-lived and backend-minted per session), so
+// this is its ONLY way to gather relay candidates. Rides the RLS-gated private room, i.e. the
+// same trust level as the SDP/ICE that follow. Robots predating the field simply ignore it.
+export interface ReadyTurn {
+  urls: string[];
+  username: string;
+  credential: string;
+}
+
 // The operator side of the signaling room. One instance per teleop session. RemoteTeleop owns
 // its lifecycle: connect() on start(), close() on stop().
 export interface SignalingTransport {
@@ -77,7 +87,10 @@ export interface SignalingTransport {
   connect(handlers: SignalingHandlers): Promise<void>;
   // Announce the operator is 'ready'. The `mac` field is legacy (room-token HMAC proof) and is
   // no longer sent by the operator — kept optional so a mock robot can still exercise it.
-  sendReady(payload: { mac?: string }): void;
+  // `grant` (pentest V1) is the backend-minted ES256 robot-session grant, bound to this peer's
+  // DTLS fingerprint; the robot verifies it before granting motion authority (warm-mode ignores
+  // it, so it's an inert sibling until the gateway's require_session_grant flag flips).
+  sendReady(payload: { mac?: string; turn?: ReadyTurn; grant?: string }): void;
   // Publish our SDP ANSWER back to the robot.
   sendSdp(payload: SdpPayload): void;
   // Publish one local ICE candidate to the robot.
