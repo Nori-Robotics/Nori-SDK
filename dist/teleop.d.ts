@@ -54,6 +54,8 @@ export interface DaemonStatus {
     state: "online" | "offline" | (string & {});
     reason?: string;
     detail?: string;
+    armed?: boolean;
+    activation?: string;
 }
 export type ConnectPhase = "idle" | "joining" | "waiting" | "negotiating" | "connected" | "failed";
 export type ConnectFailure = "signaling_unreachable" | "robot_not_responding" | "ice_failed" | "negotiation_failed" | "session_rejected";
@@ -119,6 +121,8 @@ export interface RobotInfo {
     capabilities?: string[];
 }
 export declare function supportsCapability(info: RobotInfo | null | undefined, capability: string): boolean | undefined;
+export declare function serialModelCode(serial: string): string | null;
+export declare function tunnelAddress(host: string): boolean;
 export declare function parseAck(m: Record<string, unknown>, sdkProtocolVersion?: number): RobotInfo;
 export interface CallState {
     active: boolean;
@@ -152,6 +156,7 @@ export interface RemoteTeleopOptions {
     signaling: SignalingTransport;
     videoEl?: HTMLVideoElement;
     audioEl?: HTMLAudioElement;
+    baseSigns?: "rep103" | "l2-legacy";
     stun: string;
     turnUrls: string[];
     turnUser: string;
@@ -181,6 +186,8 @@ export interface RemoteTeleopOptions {
 export declare const TASK_KEYS: Record<string, [string, number]>;
 export declare const JOINT_KEYS: Record<string, [string, number]>;
 export declare function l3JointShorts(descriptor: RobotDescriptor | undefined | null, arm: string): string[] | null;
+export declare const L2_JOINT_DOFS: readonly string[];
+export declare function jointDofsFor(descriptor: RobotDescriptor | undefined | null, side: string): string[];
 export declare function jointKeymapForShorts(shorts: string[]): Record<string, [string, number]>;
 export declare const BASE_KEYS: Record<string, [string, number]>;
 export declare const ZLIFT_KEYS: Record<string, number>;
@@ -278,6 +285,9 @@ export declare class RemoteTeleop {
         timeoutMs?: number;
     }): Promise<ActionStatus>;
     command(cmd: "estop" | "reset_latch" | "reset"): void;
+    setArmed(on: boolean): void;
+    private estopWaiters;
+    estopConfirmed(timeoutMs?: number): Promise<void>;
     setVideoQuality(quality: "low" | "normal" | number): void;
     record(action: "session_start" | "episode_start" | "episode_stop" | "episode_discard" | "session_end" | "session_discard" | "start" | "stop" | "discard" | "discard_last" | "status", task?: string, opts?: {
         stereo?: boolean;
@@ -334,6 +344,8 @@ export declare class RemoteTeleop {
     recordState(): RecordState | null;
     cameraLayout(): string | null;
     robotInfo(): RobotInfo | null;
+    private legacyL2Base;
+    private wireJog;
     perceive(): PerceptionView | null;
     perceptionAgeMs(): number | null;
     injectPerception(frame: {
@@ -349,6 +361,7 @@ export declare class RemoteTeleop {
     private sendCmd;
     onKeyDown(e: KeyboardEvent): boolean;
     onKeyUp(e: KeyboardEvent): void;
+    private resolveLifts;
     private jogTick;
 }
 //# sourceMappingURL=teleop.d.ts.map

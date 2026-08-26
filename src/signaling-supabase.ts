@@ -39,14 +39,22 @@ export class SupabaseSignaling implements SignalingTransport {
   // familiar "channel: SUBSCRIBED" trace survives the extraction.
   constructor(
     private supabase: SupabaseClient,
-    private room: string,
+    // Readonly-public: RemoteTeleop reads the room (usually the fleet serial) to key
+    // per-model wire quirks — see SignalingTransport.room.
+    readonly room: string,
     private log?: (...args: unknown[]) => void,
     private opts: { private?: boolean } = {}
   ) {}
 
   async connect(h: SignalingHandlers): Promise<void> {
     this.handlers = h;
-    this.usePrivate = this.opts.private === true;
+    // PRIVATE BY DEFAULT. The fleet is private-only (RLS-gated), and the documented
+    // quickstart passes no opts — the old public default sent every first-run to a room
+    // variant the robot never joins, surfacing 12 s later as robot_not_responding with no
+    // hint the join type was the problem. A dev who needs a public room (e.g. "nori-dev")
+    // opts OUT explicitly with { private: false } — an intentional public join, never a
+    // silent downgrade.
+    this.usePrivate = this.opts.private !== false;
     await this.openChannel();
   }
 

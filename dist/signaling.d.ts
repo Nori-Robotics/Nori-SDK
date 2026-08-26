@@ -37,5 +37,6 @@ export interface SignalingTransport {
     sendIce(payload: IcePayload): void;
     sendBye(): void;
     close(): Promise<void>;
+    readonly room?: string;
 }
 //# sourceMappingURL=signaling.d.ts.map

@@ -7,18 +7,21 @@ export interface MockSimOptions {
     seed?: number;
     jogUnitsPerS?: number;
     actionUnitsPerS?: number;
+    capabilities?: string[];
 }
 type Frame = Record<string, unknown>;
 export declare class MockDaemonSim {
     readonly descriptor: RobotDescriptor;
     readonly watchdog: WatchdogProfile;
     readonly protocolVersion: number;
+    readonly capabilities: string[];
     private st;
     private initial;
     private jog;
     private pending;
     private safety;
     private latchReason;
+    private wdState;
     private lastControlMs;
     private lastTickMs;
     private moved;
@@ -39,6 +42,7 @@ export declare class MockDaemonSim {
     private handleRecord;
     private epId;
     private handleControl;
+    private handlePose;
     private handleCommand;
     tick(nowMs: number): Frame[];
     private integrateJog;

@@ -30,8 +30,11 @@ export interface ExternalJog {
   left_arm?: Record<string, number>;
   right_arm?: Record<string, number>;
   base?: Record<string, number>;
-  // Per-arm lift (velocity, [-1,1]). The robot has one lift per arm; drive them
-  // independently. (Was a single `z_lift`.)
+  // PER-HAND lift intent (velocity, [-1,1]), NOT necessarily the wire key: an L-series
+  // robot has one lift per arm and these pass through verbatim, but the A-series has ONE
+  // central column keyed bare "lift" — RemoteTeleop resolves per-hand intent against the
+  // robot's descriptor before sending (resolveLifts), because a mapper has no descriptor
+  // and hand-derived lift keys are exactly how the A-series went silently unsupported.
   left_lift?: number;
   right_lift?: number;
 }
@@ -198,6 +201,13 @@ export interface DaemonStatus {
   //   unreachable | connection_lost   daemon down or restarting (no more-specific reason)
   reason?: string;
   detail?: string; // operator-facing text; carries the daemon's own message when it sent one
+  // online only — whether the arm buses are armed (arbiter ownership held by the
+  // gateway). Absent on robots whose gateway predates arming support.
+  armed?: boolean;
+  // online only — motion-stack activation state: "arming" | "running" (guarded
+  // activation in progress, motors not commandable yet), "active" (ready),
+  // "disarming", "inactive". Absent on older gateways.
+  activation?: string;
 }
 
 // ---- connect diagnostics ---------------------------------------------------------------
@@ -344,8 +354,11 @@ export interface RobotInfo {
   initialState?: Record<string, number>; // joint pose at session start ("<name>.pos" -> value)
   error?: string;                        // set when accepted === false
   versionMismatch: boolean;              // daemon protocolVersion differs from this SDK's target
-  // ADVISORY model/generation label ("L2", "A3") for logs and dataset provenance only —
-  // never branch on it; branch on descriptor + capabilities (nori-protocol MODELS.md).
+  // Model/generation label ("L2", "A3") for logs and dataset provenance. Behavioural
+  // branching belongs on descriptor + capabilities (nori-protocol MODELS.md) — with ONE
+  // sanctioned exception: the L2 legacy base-sign wire quirk (see legacyL2Base), a hardware
+  // trait no capability can express. Note the deployed L2 daemon predates this field and
+  // never sends it, so absence is NOT evidence of a non-L2 robot.
   model?: string;
   // Optional verbs this robot honours beyond the always-present core. THREE-VALUED by
   // design: undefined = the ack predates the field (unknown — probe or assume legacy);
@@ -364,6 +377,36 @@ export function supportsCapability(
   const caps = info?.capabilities;
   if (caps === undefined) return undefined;
   return caps.includes(capability);
+}
+
+// Fleet-serial model code: "NORI-L3-0007" -> "L3", "NORI-A3-0000" -> "A3"; non-fleet /
+// unrecognized serials (dev rooms, legacy formats) -> null. Case-insensitive, same parse as
+// the backend's _FLEET_SERIAL and the app's robotModels.ts. Lives in the SDK because the
+// wire itself is model-dependent in exactly one place (the L2 legacy base-angular sign) and
+// the SDK must resolve that without the app's help.
+export function serialModelCode(serial: string): string | null {
+  const m = /^NORI-([A-Z]\d+)/i.exec(serial.trim());
+  return m ? m[1].toUpperCase() : null;
+}
+
+// True for addresses that mean a VPN/overlay carried the candidate even though its ICE
+// type is "host". A "lan" verdict over a tunnel hands the robot the tight watchdog
+// profile on a path with tunnel latency and a 1280-byte MTU — the exact pairing that
+// silently ate every fragmented frame on the 2026-08-26 bench (Tailscale: its CGNAT
+// IPv4 range and IPv6 ULA prefix; the multi-KB ack died deterministically and an ordered
+// channel head-of-line blocked behind it). Not a general tunnel detector — it names the
+// overlay networks we have actually been bitten by. Mirrors nori-sdk-py _tunnel_address.
+export function tunnelAddress(host: string): boolean {
+  // RFC 6598 CGNAT 100.64.0.0/10 (Tailscale's IPv4 range): 100.64.x.x .. 100.127.x.x.
+  const v4 = /^100\.(\d{1,3})\./.exec(host);
+  if (v4) {
+    const octet = Number(v4[1]);
+    return octet >= 64 && octet <= 127;
+  }
+  // Tailscale's IPv6 ULA fd7a:115c:a1e0::/48. The first three hextets have no leading
+  // zeros, so every textual form — compressed or not — starts with this prefix; only
+  // case varies.
+  return host.toLowerCase().startsWith("fd7a:115c:a1e0:");
 }
 
 // Coerce a wire `ack` frame into a RobotInfo. Tolerant of old daemons that send a bare
@@ -468,6 +511,13 @@ export interface RemoteTeleopOptions {
   // NOTE: the signaling ROOM is now owned by the SignalingTransport (it addresses the room),
   // so it's no longer a RemoteTeleop option. The room token is gone too: the robot gates
   // private rooms via Supabase RLS, so the operator no longer proves a token over signaling.
+  //
+  // Base wire sign convention override. Normally auto-resolved (ack.model, else the
+  // transport's room serial): everything speaks spec REP-103 on the wire except the frozen
+  // L2 fleet, whose firmware turns opposite on angular and can never be updated. Set this
+  // only for a robot the auto-detection can't classify — an L2 living in a non-fleet dev
+  // room needs "l2-legacy"; anything else is already the default. See legacyL2Base().
+  baseSigns?: "rep103" | "l2-legacy";
   stun: string;
   turnUrls: string[];
   turnUser: string;
@@ -594,6 +644,30 @@ export function l3JointShorts(
   };
   shorts.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
   return shorts;
+}
+
+// The legacy 6-DOF joint vocabulary, derived from JOINT_KEYS so there is exactly one copy.
+export const L2_JOINT_DOFS: readonly string[] = [
+  ...new Set(Object.values(JOINT_KEYS).map(([dof]) => dof)),
+];
+
+// The per-joint DOF vocabulary ONE ARM actually accepts — what scripted/agent surfaces
+// (ScriptDriver `joint`/`moveTo`, the LLM `move_to` tool schema) validate against and
+// advertise. Derived from the descriptor when the robot sent one (spec MODELS.md: branch on
+// descriptor, never on model); the compiled-in L2 set survives ONLY as the no-descriptor
+// legacy fallback — the one place a hardcoded joint list is legitimate. A descriptor that
+// names no joints for `side` yields [] (that arm does not exist; the gateway would refuse
+// every key as unknown_joint), never the L2 fallback: substituting a vocabulary the robot
+// didn't advertise is how an agent gets taught joints that aren't there.
+export function jointDofsFor(
+  descriptor: RobotDescriptor | undefined | null, side: string,
+): string[] {
+  const joints = descriptor?.joints;
+  if (!joints) return [...L2_JOINT_DOFS];
+  const prefix = `${side}_arm_`;
+  return joints
+    .filter((k) => k.startsWith(prefix) && k.endsWith(".pos"))
+    .map((k) => k.slice(prefix.length, -".pos".length));
 }
 
 // Build a per-motor keymap for descriptor-advertised joints. The gripper
@@ -1051,8 +1125,50 @@ export class RemoteTeleop {
   }
 
   // Public command surface for non-keyboard inputs (VR E-STOP / reset). Mirrors sendCmd.
+  // NOTE: command("estop") THROWS when the control channel is known-dead — see sendCmd.
   command(cmd: "estop" | "reset_latch" | "reset") {
     this.sendCmd(cmd);
+  }
+
+  // Ask the robot to arm/disarm its motor buses (arbiter ownership on the robot side).
+  // Fire-and-forget like ordinary verbs; the truthful armed state comes BACK on
+  // daemon_status.armed — render that, never this call. Robots without arming support
+  // ignore the verb and never report `armed`.
+  setArmed(on: boolean) {
+    this.dcSend({ type: "command", [on ? "arm" : "disarm"]: true });
+    this.log(on ? "arm requested" : "disarm requested — support the arms; they de-torque");
+  }
+
+  // estopConfirmed(): resolvers waiting for the NEXT wire-reported "latched" safety state.
+  private estopWaiters: Array<() => void> = [];
+
+  // command("estop"), then await the robot REPORTING the latch in telemetry. Delivery is
+  // not execution: the channel is unreliable by design (a sent frame can vanish in flight)
+  // and the robot drops command frames with no reply while its motion stack is down.
+  // Confirmation is OBSERVED STATE — a status block parsed off the wire AFTER the send;
+  // the cached telemetry view is deliberately not consulted, because a stale "latched"
+  // from minutes ago would confirm an estop that went nowhere. Rejects on a dead channel
+  // (via command) and on timeout; the only safe reading of either is "the robot is NOT
+  // stopped". Mirrors nori-sdk-py's estop_confirmed(). Default is 5 s, not 2: the latch
+  // report crosses gateway -> safety node -> telemetry, and 2 s proved tight on a busy
+  // stack (2026-08-26 bench).
+  async estopConfirmed(timeoutMs = 5000): Promise<void> {
+    let onLatched!: () => void;
+    const latched = new Promise<void>((res) => { onLatched = res; });
+    // Subscribed BEFORE the send, so a fast robot cannot report into the gap.
+    this.estopWaiters.push(onLatched);
+    try {
+      this.command("estop"); // throws on a known-dead channel
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(
+          `estop sent but the robot never reported the latch within ${timeoutMs} ms — ` +
+          "assume it is NOT stopped (motion stack down, or the frame was lost)")), timeoutMs);
+        latched.then(() => { clearTimeout(timer); resolve(); });
+      });
+    } finally {
+      const i = this.estopWaiters.indexOf(onLatched);
+      if (i >= 0) this.estopWaiters.splice(i, 1);
+    }
   }
 
   // Ask the robot to drop / restore its camera-encoder bitrate to free CPU+bandwidth while
@@ -1507,8 +1623,17 @@ export class RemoteTeleop {
       // robot (re)joined the room -> re-announce 'ready' so it (re)offers. The room token is
       // retired: the robot gates private-room access itself (Supabase RLS), so there's no HMAC
       // proof to compute here anymore — we just handshake.
+      //
+      // Do NOT clear `connected` here. The gateway broadcasts robot_here on EVERY room join —
+      // including its own signaling auto-reconnect mid-session — and the only thing that ever
+      // sets the flag back is pc.onconnectionstatechange, which never re-fires on a healthy
+      // peer. Clearing it re-armed the 2 s ready-resend forever and disabled the live-session
+      // guards on onNack/onState, so a stray nack or a routine CHANNEL_ERROR flap painted
+      // `failed` over a session that was actively driving. The ready IS still sent: a gateway
+      // that already has us dedupes re-readys, and a RESTARTED one (no session) needs it to
+      // offer — its robot_here usually beats us noticing the dead peer. Same fix as the
+      // Python SDK's _on_robot_here.
       onRobotHere: async () => {
-        this.connected = false;
         this.log("robot announced — sending 'ready'");
         this.sendReady();
       },
@@ -1532,7 +1657,10 @@ export class RemoteTeleop {
       },
 
       onOpen: () => {
-        this.connected = false;
+        // No `connected = false` here either (see onRobotHere): onOpen fires on every
+        // signaling reconnect, and the connection-state callback owns that flag. The
+        // retry loop below already no-ops while connected, so a live session never
+        // chatters — and if the peer later drops, the same loop resumes announcing.
         this.sendReady();
         this.log("announced 'ready' — waiting for robot offer");
         // Only (re)enter `waiting` from a pre-connection phase. onOpen also fires on a mid-session
@@ -1746,9 +1874,12 @@ export class RemoteTeleop {
       }
       if (!pair) return;
       const p = pair as RTCStats & { localCandidateId: string; remoteCandidateId: string };
-      const local = stats.get(p.localCandidateId) as (RTCStats & { candidateType?: string }) | undefined;
-      const remote = stats.get(p.remoteCandidateId) as (RTCStats & { candidateType?: string }) | undefined;
+      const local = stats.get(p.localCandidateId) as
+        (RTCStats & { candidateType?: string; address?: string; ip?: string }) | undefined;
+      const remote = stats.get(p.remoteCandidateId) as
+        (RTCStats & { candidateType?: string; address?: string; ip?: string }) | undefined;
       const t = (c?: { candidateType?: string }) => (c ? c.candidateType : "?");
+      const addr = (c?: { address?: string; ip?: string }) => c?.address ?? c?.ip ?? "";
       const relayed = t(local) === "relay" || t(remote) === "relay";
       this.log(
         `ICE path: local=${t(local)} remote=${t(remote)}` +
@@ -1757,7 +1888,14 @@ export class RemoteTeleop {
       // Both candidates 'host' => direct same-subnet LAN; anything else (srflx via
       // STUN, relay via TURN) is WAN. Tell the daemon so it uses the matching watchdog
       // profile (LAN 150/500 vs WAN 300/1000) instead of always assuming WAN.
-      this.linkMode = t(local) === "host" && t(remote) === "host" ? "lan" : "wan";
+      // EXCEPT: a VPN/overlay candidate is ICE-type "host" too, and calling that "lan"
+      // hands the robot the tight profile on a 1280-MTU tunnel — see tunnelAddress().
+      // (An absent/mDNS-obfuscated address can't rule the tunnel out; the historical
+      // host/host verdict stands there.)
+      this.linkMode =
+        t(local) === "host" && t(remote) === "host" &&
+        !tunnelAddress(addr(local)) && !tunnelAddress(addr(remote))
+          ? "lan" : "wan";
       this.tel.linkMode = this.linkMode;
       this.o.onTelemetry({ ...this.tel }); // surface the link chip as soon as the path resolves
       this.sendLink();
@@ -1805,7 +1943,15 @@ export class RemoteTeleop {
             motor_faults?: Record<string, string> }
         | undefined;
       if (status) {
-        if (status.safety) this.tel.safety = status.safety;
+        if (status.safety) {
+          this.tel.safety = status.safety;
+          // estopConfirmed(): only a latch reported ON THE WIRE counts, and this is the
+          // one place a wire status block is parsed — waiters can never resolve from the
+          // cached view.
+          if (status.safety === "latched" && this.estopWaiters.length) {
+            for (const w of this.estopWaiters.splice(0)) w();
+          }
+        }
         // null/absent -> not latched; replace wholesale so a cleared latch drops the banner.
         this.tel.latchReason = typeof status.latch_reason === "string" ? status.latch_reason : null;
         if (status.watchdog) this.tel.watchdog = status.watchdog;
@@ -1979,9 +2125,12 @@ export class RemoteTeleop {
     const s: DaemonStatus = { state: String(m.state ?? "") };
     if (typeof m.reason === "string" && m.reason) s.reason = m.reason;
     if (typeof m.detail === "string" && m.detail) s.detail = m.detail;
+    if (typeof m.armed === "boolean") s.armed = m.armed;
+    if (typeof m.activation === "string" && m.activation) s.activation = m.activation;
     if (!s.state) return;
     const prev = this.daemonStat;
-    if (prev && prev.state === s.state && prev.reason === s.reason && prev.detail === s.detail) return;
+    if (prev && prev.state === s.state && prev.reason === s.reason && prev.detail === s.detail
+        && prev.armed === s.armed && prev.activation === s.activation) return;
     this.daemonStat = s;
     // Operator-facing log line: no reason code, no raw detail — the on-screen banner carries the
     // plain-English remedy for the same event.
@@ -2062,6 +2211,40 @@ export class RemoteTeleop {
     return this.ackInfo;
   }
 
+  // Does THIS robot need the L2 legacy base wire (angular negated on the wire)? The public
+  // convention is spec REP-103 everywhere — +linear forward, +angular left — and every jog
+  // producer in this SDK now emits it. The deployed L2 fleet's firmware turns opposite on
+  // ANGULAR (only — its linear is true; the old keyboard both-axes negation was a bug that
+  // drove keyboard-forward backwards on every model) and its daemon is frozen, so the
+  // compensation the spec says belongs in the robot's own actuator adapter has to live
+  // client-side for L2, forever, behind this positive match. Resolution order:
+  //   1. opts.baseSigns — explicit override for robots auto-detection can't classify.
+  //   2. ack.model — a robot that names itself is believed (no deployed L2 sends it, but a
+  //      positive non-L2 answer beats any room-name guess).
+  //   3. the transport room's fleet serial ("NORI-L2-0007" -> L2).
+  // Unknown resolves to REP-103: the legacy branch is keyed to a positive L2 match and is
+  // never the fallback, so a future model can't inherit the quirk by omission.
+  private legacyL2Base(): boolean {
+    if (this.o.baseSigns) return this.o.baseSigns === "l2-legacy";
+    const ackModel = this.ackInfo?.model;
+    if (ackModel) return ackModel.toUpperCase() === "L2";
+    const room = this.o.signaling.room;
+    return !!room && serialModelCode(room) === "L2";
+  }
+
+  // The one place REP-103 becomes wire bytes. Identity for every robot except a matched L2,
+  // where base.angular flips sign (zeros pass unchanged — -0 stops a robot just as well).
+  // Applied at BOTH outbound jog sites (keyboard tick + externalJog), so VR mappers and
+  // script drivers stay sign-blind: they emit REP-103 and never learn the quirk exists.
+  private wireJog<T extends object>(jog: T): T {
+    if (!this.legacyL2Base()) return jog;
+    const base = (jog as { base?: unknown }).base;
+    if (!base || typeof base !== "object") return jog;
+    const b = base as Record<string, number>;
+    if (typeof b.angular !== "number" || b.angular === 0) return jog;
+    return { ...jog, base: { ...b, angular: -b.angular } };
+  }
+
   // ---- perception (Phase F / G3) -------------------------------------------
   // Latest world-state from the daemon perception process, or null if none has arrived (detector
   // not running / not connected). A running script polls this to close a loop:
@@ -2086,18 +2269,26 @@ export class RemoteTeleop {
     this.ingestPerception({ type: "perception", ...frame } as unknown as Record<string, unknown>);
   }
 
-  private dcSend(obj: unknown) {
-    if (this.controlCh && this.controlCh.readyState === "open") {
+  // True when the frame was handed to an open channel, false when it was dropped. Dropping
+  // is correct for ordinary verbs (the channel is unreliable by design and the robot is
+  // watchdogged, so a frame into a dead channel has no meaning to preserve) — but a caller
+  // must not claim delivery it didn't get: log on the return value, not on having called.
+  private dcSend(obj: unknown): boolean {
+    if (!this.controlCh || this.controlCh.readyState !== "open") return false;
+    try {
       this.controlCh.send(JSON.stringify(obj));
-      const rec = obj as Record<string, unknown>;
-      if (rec && rec.type === "control" && this.o.onControlSent) {
-        try {
-          this.o.onControlSent(rec, Date.now());
-        } catch {
-          // observer must never break the control path
-        }
+    } catch {
+      return false;
+    }
+    const rec = obj as Record<string, unknown>;
+    if (rec && rec.type === "control" && this.o.onControlSent) {
+      try {
+        this.o.onControlSent(rec, Date.now());
+      } catch {
+        // observer must never break the control path
       }
     }
+    return true;
   }
 
   // NOTE: the handshake lives in `ackInfo` (declared above) and is read through the public
@@ -2132,9 +2323,19 @@ export class RemoteTeleop {
   private sendCmd(cmd: string) {
     this.pressed.clear(); // don't let a held key fight the command
     const armKey = `${this.o.arm}_arm`;
-    if (cmd === "reset") this.dcSend({ type: "control", reset: { [armKey]: true } });
-    else this.dcSend({ type: "command", [cmd]: true });
-    this.log("cmd: " + cmd);
+    const sent = cmd === "reset"
+      ? this.dcSend({ type: "control", reset: { [armKey]: true } })
+      : this.dcSend({ type: "command", [cmd]: true });
+    if (!sent && cmd === "estop") {
+      // The one verb where a silent drop must not read as success: an E-STOP that went
+      // nowhere means the caller has to reach for the physical button, and this used to
+      // log "cmd: estop" unconditionally — a lie on a dead channel. Ordinary verbs keep
+      // the drop-silently contract. Mirrors nori-sdk-py's estop().
+      throw new Error(
+        "estop: control channel is not open — the frame went NOWHERE. This session " +
+        "cannot stop the robot; use the physical E-STOP or the robot's face button.");
+    }
+    this.log("cmd: " + cmd + (sent ? "" : " (dropped — channel not open)"));
   }
 
   // ---- keyboard (called by the page's window listeners) --------------------
@@ -2150,7 +2351,12 @@ export class RemoteTeleop {
       return true;
     }
     if (k in CMD_KEYS) {
-      if (!this.cmdDown.has(k)) { this.cmdDown.add(k); this.sendCmd(CMD_KEYS[k]); }
+      if (!this.cmdDown.has(k)) {
+        this.cmdDown.add(k);
+        // estop THROWS on a dead channel (see sendCmd); the session log is the surface —
+        // it must not escape into the page's window keydown listener.
+        try { this.sendCmd(CMD_KEYS[k]); } catch (e) { this.log((e as Error).message); }
+      }
       return true;
     }
     if (k in this.armKeymap() || k in BASE_KEYS || k in ZLIFT_KEYS) {
@@ -2166,6 +2372,29 @@ export class RemoteTeleop {
     this.cmdDown.delete(k);
   }
 
+  // External mappers (VR) speak PER-HAND lift intent: left_lift / right_lift. That is the
+  // wire vocabulary on an L-series robot, but the A-series has ONE central column keyed
+  // bare "lift" — the per-hand names there are ignored in SILENCE, so the operator pressed
+  // lift and nothing moved. The keyboard path and ScriptDriver were both fixed for exactly
+  // this (rail.ts liftJogKey is the single resolver); this is the same fix for the external
+  // stream, applied here because the mapper is descriptor-blind and this class holds the
+  // ack. When both hands land on the same central column the rates sum, clamped, so an
+  // opposing pair holds rather than one hand silently winning.
+  private resolveLifts(jog: ExternalJog): Record<string, unknown> {
+    const { left_lift, right_lift, ...rest } = jog;
+    const out: Record<string, unknown> = { ...rest };
+    const hands: Array<["left" | "right", number | undefined]> =
+      [["left", left_lift], ["right", right_lift]];
+    for (const [side, rate] of hands) {
+      if (!rate) continue; // absent/zero: nothing commanded (absence reads as rate 0)
+      const key = liftJogKey(this.ackInfo?.descriptor, side);
+      if (!key) continue;  // robot advertises no lift: omit rather than invent a key
+      const prev = typeof out[key] === "number" ? (out[key] as number) : 0;
+      out[key] = Math.max(-1, Math.min(1, prev + rate));
+    }
+    return out;
+  }
+
   // 50 Hz level jog stream from the held-key set (daemon is level-triggered)
   private jogTick() {
     const ch = this.controlCh;
@@ -2179,13 +2408,14 @@ export class RemoteTeleop {
     // control-liveness heartbeat stays fresh. sendAction is the sole arm driver.
     const leader = this.policyDriving ? null : this.externalLeader;
 
-    // VR (or another mapper) owns the stream: send its payload verbatim. It already
-    // carries left_arm/right_arm/base/left_lift/right_lift in the daemon's jog vocabulary, so this is
-    // the identical wire frame the keyboard path below produces — just a different source.
+    // VR (or another mapper) owns the stream: resolve its per-hand lift intent against the
+    // descriptor (resolveLifts — the mapper is descriptor-blind), then send through the same
+    // wireJog gate as the keyboard path (identity except the L2 legacy angular flip).
     // Suppressed while a leader source drives the arms: leader (absolute) and VR-jog would
     // otherwise fight over the same arm joints.
     if (this.externalJog && !leader) {
-      this.dcSend({ type: "control", seq: this.seq++, jog: this.externalJog });
+      this.dcSend({ type: "control", seq: this.seq++,
+        jog: this.wireJog(this.resolveLifts(this.externalJog)) });
       return;
     }
 
@@ -2209,10 +2439,12 @@ export class RemoteTeleop {
       // While a leader source drives the arms, arm keys are ignored (leader wins on those
       // joints); base + lift keys still apply so the operator drives the base/rails by hand.
       if (!leader && k in km) { const [d, s] = km[k]; a[d] = s * sp; }
-      // Firmware drives the base opposite our sign convention on BOTH axes (+linear =
-      // forward, +angular = left), so negate on the wire — keeps BASE_KEYS/legend reading
-      // naturally (i/w = forward, a/j = left) while sending what the firmware actually wants.
-      else if (k in BASE_KEYS) { const [dof, s] = BASE_KEYS[k]; base[dof] = -s * sp; }
+      // REP-103 straight through: BASE_KEYS signs (i/w = +linear forward, a/j = +angular
+      // left) ARE the wire values. This used to negate both axes "for the firmware" — but
+      // only the L2 turns opposite, only on angular, and that flip now happens in wireJog
+      // behind a positive L2 match, so the negation here inverted keyboard-forward on every
+      // model and keyboard-left on everything that wasn't an L2.
+      else if (k in BASE_KEYS) { const [dof, s] = BASE_KEYS[k]; base[dof] = s * sp; }
       else if (k in ZLIFT_KEYS) z = ZLIFT_KEYS[k] * sp;
     }
     // Leader mode: arms come from leader_action_deg, so the jog carries only base + lift.
@@ -2230,7 +2462,7 @@ export class RemoteTeleop {
       const lk = liftJogKey(this.ackInfo?.descriptor, this.o.arm);
       if (lk) jog[lk] = z;
     }
-    const frame: Record<string, unknown> = { type: "control", seq: this.seq++, jog };
+    const frame: Record<string, unknown> = { type: "control", seq: this.seq++, jog: this.wireJog(jog) };
     if (leader) frame.leader_action_deg = leader;
     this.dcSend(frame);
   }

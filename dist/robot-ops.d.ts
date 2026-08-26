@@ -1,3 +1,4 @@
+import type { RobotDescriptor } from "./teleop";
 /** Cylindrical (task-space) DOFs a `reach` accepts — derived from TASK_KEYS. */
 export declare const REACH_DOFS: string[];
 /** Per-joint DOFs `joint`/`move_to` accept — derived from JOINT_KEYS. */
@@ -38,8 +39,15 @@ export interface RobotOp {
     codegen?: CodegenSurface;
 }
 export declare const ROBOT_OPS: RobotOp[];
-/** The Anthropic tools array — drop-in for lelab/server.py NORI_AGENT_TOOLS. */
-export declare function buildAgentTools(): Array<{
+/**
+ * The Anthropic tools array — drop-in for lelab/server.py NORI_AGENT_TOOLS.
+ *
+ * Pass the CONNECTED robot's descriptor (RobotInfo.descriptor, from the ack) so the move_to
+ * schema teaches the joints this robot actually has — without it the L2 legacy vocabulary is
+ * rendered, which on an A3 names six joints that don't exist while omitting the seven that do
+ * (every hallucinated call then costs a round-trip unknown_joint refusal).
+ */
+export declare function buildAgentTools(descriptor?: RobotDescriptor | null): Array<{
     name: string;
     description: string;
     input_schema: Record<string, unknown>;

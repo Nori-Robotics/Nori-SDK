@@ -2,7 +2,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { SignalingTransport, SignalingHandlers, SdpPayload, IcePayload } from "./signaling";
 export declare class SupabaseSignaling implements SignalingTransport {
     private supabase;
-    private room;
+    readonly room: string;
     private log?;
     private opts;
     private channel;
