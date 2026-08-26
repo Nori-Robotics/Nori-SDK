@@ -1,6 +1,13 @@
 import type { RobotDescriptor } from "./teleop";
 /** Cylindrical (task-space) DOFs a `reach` accepts — derived from TASK_KEYS. */
 export declare const REACH_DOFS: string[];
+/**
+ * Task-space DOFs `reach` accepts on THIS robot — resolved from the live descriptor the same
+ * way jointDofsFor resolves joints (branch on descriptor, never on model). With
+ * descriptor.jog_scale.task advertised (A3) that is the cartesian vocabulary (yaw canonical,
+ * z included); no descriptor / no task scale (every L2) yields exactly REACH_DOFS.
+ */
+export declare function reachDofsFor(descriptor: RobotDescriptor | undefined | null): string[];
 /** Per-joint DOFs `joint`/`move_to` accept — derived from JOINT_KEYS. */
 export declare const JOINT_DOFS: string[];
 /** Mobile-base DOFs `base` accepts — derived from BASE_KEYS. */

@@ -56,6 +56,7 @@ export interface DaemonStatus {
     detail?: string;
     armed?: boolean;
     activation?: string;
+    activation_detail?: string;
 }
 export type ConnectPhase = "idle" | "joining" | "waiting" | "negotiating" | "connected" | "failed";
 export type ConnectFailure = "signaling_unreachable" | "robot_not_responding" | "ice_failed" | "negotiation_failed" | "session_rejected";
@@ -92,6 +93,7 @@ export interface RobotDescriptor {
     aux?: string[];
     cameras?: string[];
     ranges?: Record<string, [number, number]>;
+    ranges_si?: Record<string, [number, number]>;
     jog_scale?: {
         joints?: Record<string, number>;
         task?: {
@@ -99,6 +101,7 @@ export interface RobotDescriptor {
             y?: number;
             z?: number;
             pitch?: number;
+            yaw?: number;
             shoulder_pan?: number;
         };
         base?: {
@@ -185,6 +188,9 @@ export interface RemoteTeleopOptions {
 }
 export declare const TASK_KEYS: Record<string, [string, number]>;
 export declare const JOINT_KEYS: Record<string, [string, number]>;
+export declare const CARTESIAN_TASK_KEYS: Record<string, [string, number]>;
+export declare function taskKeymapFor(descriptor: RobotDescriptor | undefined | null): Record<string, [string, number]>;
+export declare function taskModeLabel(descriptor: RobotDescriptor | undefined | null): "cartesian" | "cylindrical";
 export declare function l3JointShorts(descriptor: RobotDescriptor | undefined | null, arm: string): string[] | null;
 export declare const L2_JOINT_DOFS: readonly string[];
 export declare function jointDofsFor(descriptor: RobotDescriptor | undefined | null, side: string): string[];
@@ -204,7 +210,7 @@ export interface BaseKeyCluster {
     right: string;
 }
 export declare function baseKeyClusters(): BaseKeyCluster[];
-export declare function keybindLegend(mode: ControlMode, jointShorts?: string[] | null): {
+export declare function keybindLegend(mode: ControlMode, jointShorts?: string[] | null, descriptor?: RobotDescriptor | null): {
     arm: KeybindRow[];
     base: KeybindRow[];
     lift: KeybindRow;

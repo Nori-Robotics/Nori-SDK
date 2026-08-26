@@ -161,6 +161,33 @@ export const JOINT_KEYS = {
     t: ["wrist_roll", 1], g: ["wrist_roll", -1],
     y: ["gripper", 1], h: ["gripper", -1],
 };
+// ---- A3: descriptor-gated cartesian task jog (additive; L2 byte-identical) ----
+// The A3 gateway advertises descriptor.jog_scale.task = {x,y,z,pitch,yaw,shoulder_pan};
+// L2 daemons never send jog_scale.task. PRESENCE of that field — never a model string —
+// gates the cartesian keymap/label below. `yaw` is the canonical angular-z verb
+// (shoulder_pan is a deprecated alias the gateway still accepts); new clients send yaw.
+// Key choices deliberately avoid i/k/j/l (base), u/o (lift), m (mode toggle) and
+// space/p/c (commands); y/h are free in task mode (they only carry gripper in JOINT_KEYS).
+export const CARTESIAN_TASK_KEYS = {
+    q: ["yaw", 1], e: ["yaw", -1],
+    w: ["x", 1], s: ["x", -1], a: ["y", 1], d: ["y", -1],
+    y: ["z", 1], h: ["z", -1],
+    z: ["pitch", 1], x: ["pitch", -1], r: ["wrist_roll", 1], f: ["wrist_roll", -1],
+    t: ["gripper", 1], g: ["gripper", -1],
+};
+// The task-mode keymap for a given descriptor. No descriptor jog_scale.task (every L2,
+// and any pre-ack session) returns the EXACT legacy TASK_KEYS object — same reference,
+// same bytes on the wire — so deployed L2 units behave byte-identically.
+export function taskKeymapFor(descriptor) {
+    return descriptor?.jog_scale?.task ? CARTESIAN_TASK_KEYS : TASK_KEYS;
+}
+// Display label for the non-joint control mode. The ControlMode VALUE stays
+// "cylindrical" everywhere (public type, persisted state — never on the wire); only
+// what the operator READS changes: "cartesian" when the descriptor advertises a task
+// jog vocabulary (A3), "cylindrical" otherwise (L2 / unknown).
+export function taskModeLabel(descriptor) {
+    return descriptor?.jog_scale?.task ? "cartesian" : "cylindrical";
+}
 // ---- L3: descriptor-driven per-motor jog (additive; L2 byte-identical) ----
 // L2 daemons advertise (or predate) the classic 6-DOF vocabulary in
 // JOINT_KEYS; the L3 gateway's ack descriptor advertises its real arm joints
@@ -284,12 +311,16 @@ export function baseKeyClusters() {
 }
 // Structured control legend for a given mode — derived from the exported maps above so it
 // can never drift from what the keys actually send.
-export function keybindLegend(mode, jointShorts) {
+export function keybindLegend(mode, jointShorts, 
+// Descriptor threads the task vocabulary the same way jointShorts threads the L3
+// per-motor one: with jog_scale.task advertised (A3) the legend shows yaw/z;
+// omitted/null (every L2) renders the exact legacy legend.
+descriptor) {
     const [u, o] = Object.entries(ZLIFT_KEYS).sort((a, b) => b[1] - a[1]).map(([k]) => k);
     return {
         arm: rowsFromAxisMap(mode === "joint"
             ? (jointShorts ? jointKeymapForShorts(jointShorts) : JOINT_KEYS)
-            : TASK_KEYS),
+            : taskKeymapFor(descriptor)),
         base: rowsFromAxisMap(BASE_KEYS),
         lift: { dof: "lift (selected arm)", posKey: u, negKey: o },
         commands: [
@@ -1711,11 +1742,14 @@ export class RemoteTeleop {
             s.armed = m.armed;
         if (typeof m.activation === "string" && m.activation)
             s.activation = m.activation;
+        if (typeof m.activation_detail === "string" && m.activation_detail)
+            s.activation_detail = m.activation_detail;
         if (!s.state)
             return;
         const prev = this.daemonStat;
         if (prev && prev.state === s.state && prev.reason === s.reason && prev.detail === s.detail
-            && prev.armed === s.armed && prev.activation === s.activation)
+            && prev.armed === s.armed && prev.activation === s.activation
+            && prev.activation_detail === s.activation_detail)
             return;
         this.daemonStat = s;
         // Operator-facing log line: no reason code, no raw detail — the on-screen banner carries the
@@ -1888,8 +1922,10 @@ export class RemoteTeleop {
         return l3JointShorts(this.ackInfo?.descriptor, this.o.arm);
     }
     armKeymap() {
+        // Task mode: descriptor-gated (CARTESIAN_TASK_KEYS on A3; the EXACT legacy
+        // TASK_KEYS object when no jog_scale.task — every L2 stays byte-identical).
         if (this.mode !== "joint")
-            return TASK_KEYS;
+            return taskKeymapFor(this.ackInfo?.descriptor);
         const cached = this.dynamicKeymap;
         if (cached && cached.arm === this.o.arm)
             return cached.map;
@@ -1902,7 +1938,9 @@ export class RemoteTeleop {
         this.mode = m;
         this.pressed.clear();
         this.o.onMode(m);
-        this.log("control mode: " + (m === "joint" ? "per-motor" : "cylindrical (rpi4)"));
+        this.log("control mode: " + (m === "joint" ? "per-motor"
+            : taskModeLabel(this.ackInfo?.descriptor) === "cartesian" ? "cartesian"
+                : "cylindrical (rpi4)"));
     }
     sendCmd(cmd) {
         this.pressed.clear(); // don't let a held key fight the command

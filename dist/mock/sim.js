@@ -42,6 +42,9 @@ const TASK_DOF_TO_JOINT = {
     x: "elbow_flex",
     y: "shoulder_lift",
     pitch: "wrist_flex",
+    // Canonical angular-z verb (A3 vocabulary); alias of the deprecated shoulder_pan, which
+    // already resolves directly as a joint name (the `key in this.st` branch above the map).
+    yaw: "shoulder_pan",
 };
 export class MockDaemonSim {
     constructor(opts) {

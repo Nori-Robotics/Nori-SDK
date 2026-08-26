@@ -23,13 +23,22 @@
 // L2-era stack) and what a session without a descriptor falls back to, per the spec's
 // discovery rules (MODELS.md: the no-descriptor fallback is the ONLY legitimate hardcoded
 // joint list).
-import { TASK_KEYS, JOINT_KEYS, BASE_KEYS, jointDofsFor } from "./teleop";
+import { TASK_KEYS, JOINT_KEYS, BASE_KEYS, jointDofsFor, taskKeymapFor } from "./teleop";
 // Unique DOF names per mode, in declaration order, from the same keybind maps the jog stream uses.
 const dofNames = (m) => [
     ...new Set(Object.values(m).map(([dof]) => dof)),
 ];
 /** Cylindrical (task-space) DOFs a `reach` accepts — derived from TASK_KEYS. */
 export const REACH_DOFS = dofNames(TASK_KEYS);
+/**
+ * Task-space DOFs `reach` accepts on THIS robot — resolved from the live descriptor the same
+ * way jointDofsFor resolves joints (branch on descriptor, never on model). With
+ * descriptor.jog_scale.task advertised (A3) that is the cartesian vocabulary (yaw canonical,
+ * z included); no descriptor / no task scale (every L2) yields exactly REACH_DOFS.
+ */
+export function reachDofsFor(descriptor) {
+    return dofNames(taskKeymapFor(descriptor));
+}
 /** Per-joint DOFs `joint`/`move_to` accept — derived from JOINT_KEYS. */
 export const JOINT_DOFS = dofNames(JOINT_KEYS);
 /** Mobile-base DOFs `base` accepts — derived from BASE_KEYS. */
@@ -122,7 +131,7 @@ export const ROBOT_OPS = [
                     dofs: {
                         type: "object",
                         additionalProperties: { type: "number" },
-                        description: "subset of {x, y, pitch, shoulder_pan, wrist_roll, gripper}, each a rate in [-1,1]; +x forward, +y left",
+                        description: "subset of the robot's advertised task DOFs (yaw is canonical, shoulder_pan is a deprecated alias), each a rate in [-1,1]; +x forward, +y left, +z up",
                     },
                     ms: { type: "number" },
                 },
@@ -131,8 +140,9 @@ export const ROBOT_OPS = [
         codegen: {
             js: "reach",
             signature: "(side, dofs, ms)",
-            summary: "Task-space (cylindrical) jog via IK. dofs subset of {x, y, pitch, shoulder_pan, " +
-                "wrist_roll, gripper}, each a rate in [-1,1]. Held ms, then zeroed.",
+            summary: "Task-space jog via IK. dofs: a subset of the robot's advertised task DOFs (yaw is " +
+                "canonical, shoulder_pan is a deprecated alias), each a rate in [-1,1]; +x forward, " +
+                "+y left, +z up. Held ms, then zeroed.",
         },
     },
     {
