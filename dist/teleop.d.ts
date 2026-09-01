@@ -56,6 +56,8 @@ export interface DaemonStatus {
     detail?: string;
     armed?: boolean;
     activation?: string;
+    estop?: string;
+    estop_detail?: string;
     activation_detail?: string;
 }
 export type ConnectPhase = "idle" | "joining" | "waiting" | "negotiating" | "connected" | "failed";
@@ -155,6 +157,96 @@ export interface RecordState {
     stereo?: boolean;
     error?: string;
 }
+export type NavigationState = "idle" | "starting" | "navigating" | "canceling" | "succeeded" | "canceled" | "aborted" | "failed" | "unavailable" | (string & {});
+export interface WaypointSummary {
+    name: string;
+    savedAtUnix: number;
+}
+/** Self-contained named-navigation reply or lifecycle snapshot. */
+export interface NavigationStatus {
+    ok: boolean;
+    state: NavigationState;
+    active: boolean;
+    requestId?: string;
+    goalId?: string;
+    name?: string;
+    mapSha256?: string;
+    distanceRemainingM?: number;
+    estimatedTimeRemainingS?: number;
+    numberOfRecoveries?: number;
+    errorCode?: number;
+    error?: string;
+    replaced?: boolean;
+    deleted?: boolean;
+    waypoints?: WaypointSummary[];
+    /**
+     * Set ONLY on a status this client synthesized because the robot's reply never
+     * arrived (reply timeout, closed control channel, or session teardown). The
+     * robot never sends it.
+     *
+     * The robot's real state is UNKNOWN on such a status: a lost reply is not a lost
+     * command, so a `start` that times out may well be driving right now. `state` and
+     * `active` here are the last values the ROBOT reported, carried forward and
+     * therefore stale — never fresh observations. Do not read `active: false` on an
+     * unreachable status as confirmation that the robot has stopped; if you need it
+     * stopped and cannot confirm delivery, use the physical E-stop.
+     */
+    unreachable?: boolean;
+}
+export interface RosStamp {
+    sec: number;
+    nanosec: number;
+}
+export interface SensorStreamConfig {
+    /** Maximum LiDAR frames/s; zero disables LiDAR delivery. */
+    lidarHz?: number;
+    /** Maximum IMU samples/s; zero disables IMU delivery. */
+    imuHz?: number;
+    /** Maximum ranges per LiDAR frame; the robot uniformly samples if needed. */
+    lidarMaxPoints?: number;
+}
+export interface SensorStreamStatus {
+    ok: boolean;
+    requestId: string;
+    lidarHz: number;
+    imuHz: number;
+    lidarMaxPoints: number;
+    lidarAvailable: boolean;
+    imuAvailable: boolean;
+    error?: string;
+    /**
+     * Set ONLY on a status this client synthesized because the robot's reply never
+     * arrived. Every other field is the last value the robot reported (or the
+     * documented default when it has reported nothing yet), not a fresh observation.
+     */
+    unreachable?: boolean;
+}
+export interface LidarScan {
+    stamp: RosStamp;
+    frameId: string;
+    angleMinRad: number;
+    angleMaxRad: number;
+    angleIncrementRad: number;
+    timeIncrementS: number;
+    scanTimeS: number;
+    rangeMinM: number;
+    rangeMaxM: number;
+    /** Number of readings on the source ROS scan, before optional sampling. */
+    sourcePoints: number;
+    /** `null` is a ROS NaN/Infinity reading, not a measured distance. */
+    rangesM: Array<number | null>;
+    intensities?: Array<number | null>;
+}
+export interface ImuSample {
+    stamp: RosStamp;
+    frameId: string;
+    orientationXyzw: [number | null, number | null, number | null, number | null];
+    orientationCovariance: Array<number | null>;
+    angularVelocityRadS: [number | null, number | null, number | null];
+    angularVelocityCovariance: Array<number | null>;
+    linearAccelerationMS2: [number | null, number | null, number | null];
+    linearAccelerationCovariance: Array<number | null>;
+}
 export interface RemoteTeleopOptions {
     signaling: SignalingTransport;
     videoEl?: HTMLVideoElement;
@@ -185,6 +277,13 @@ export interface RemoteTeleopOptions {
     onReady?: (info: RobotInfo) => void;
     onRecord?: (s: RecordState) => void;
     onPolicyStream?: (s: PolicyStreamStatus) => void;
+    onNavigationStatus?: (s: NavigationStatus) => void;
+    /** Effective stream settings and current /scan and /imu/data publisher presence. */
+    onSensorStreamStatus?: (s: SensorStreamStatus) => void;
+    /** Rate-limited filtered `/scan` samples; enabled with configureSensorStreams(). */
+    onLidarScan?: (scan: LidarScan) => void;
+    /** Rate-limited `/imu/data` samples; enabled with configureSensorStreams(). */
+    onImu?: (sample: ImuSample) => void;
 }
 export declare const TASK_KEYS: Record<string, [string, number]>;
 export declare const JOINT_KEYS: Record<string, [string, number]>;
@@ -255,6 +354,13 @@ export declare class RemoteTeleop {
     private recStat;
     private psStat;
     private psWaiters;
+    private navigationStat;
+    private navigationWaiters;
+    private navigationGoalWaiters;
+    private sensorStat;
+    private lidarStat;
+    private imuStat;
+    private sensorWaiters;
     private ackInfo;
     private micStream;
     private micTrack;
@@ -278,6 +384,43 @@ export declare class RemoteTeleop {
     sendAction(action: Record<string, number>, actionId?: string): void;
     nextActionId(): string;
     sendPose(side: "left" | "right", positionM: [number, number, number] | number[], orientationXyzw?: [number, number, number, number] | number[], actionId?: string): void;
+    private requestUuid;
+    private unreachableNavigation;
+    private unreachableSensorStream;
+    private navigationRequest;
+    listWaypoints(opts?: {
+        timeoutMs?: number;
+    }): Promise<NavigationStatus>;
+    rememberWaypoint(name: string, opts?: {
+        timeoutMs?: number;
+    }): Promise<NavigationStatus>;
+    deleteWaypoint(name: string, opts?: {
+        timeoutMs?: number;
+    }): Promise<NavigationStatus>;
+    navigateToWaypoint(name: string, opts?: {
+        timeoutMs?: number;
+    }): Promise<NavigationStatus>;
+    cancelNavigation(goalId?: string, opts?: {
+        timeoutMs?: number;
+    }): Promise<NavigationStatus>;
+    getNavigationStatus(opts?: {
+        timeoutMs?: number;
+    }): Promise<NavigationStatus>;
+    latestNavigationStatus(): NavigationStatus | null;
+    awaitNavigation(goalId: string, opts?: {
+        timeoutMs?: number;
+    }): Promise<NavigationStatus>;
+    private sensorRequest;
+    /** Configure either stream. Omitted settings retain their current robot-side value. */
+    configureSensorStreams(config: SensorStreamConfig, opts?: {
+        timeoutMs?: number;
+    }): Promise<SensorStreamStatus>;
+    getSensorStreamStatus(opts?: {
+        timeoutMs?: number;
+    }): Promise<SensorStreamStatus>;
+    latestSensorStreamStatus(): SensorStreamStatus | null;
+    latestLidarScan(): LidarScan | null;
+    latestImuSample(): ImuSample | null;
     policyStream(action: "start" | "stop" | "status", opts?: {
         dest?: "laptop" | "cloud";
         target?: string;
@@ -346,6 +489,12 @@ export declare class RemoteTeleop {
     private ingestDaemonStatus;
     daemonStatus(): DaemonStatus | null;
     private ingestPolicyStream;
+    private ingestNavigationStatus;
+    private ingestSensorStreamStatus;
+    private sensorStamp;
+    private sensorNumbers;
+    private ingestLidarScan;
+    private ingestImu;
     private ingestRecordStatus;
     recordState(): RecordState | null;
     cameraLayout(): string | null;
